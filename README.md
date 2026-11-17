@@ -22,17 +22,21 @@ traffic to find congestion and suggest improvements to STP, HSRP and ACLs.
 ## Usage
 
 ```powershell
-python main.py
+python main.py                                   # interactive menu
+python main.py --load "C:\path\to\my-project"   # load a project directly
 ```
 
-1. Create a project and pick a collection method.
-2. Add devices to `projects/<name>/hosts.txt`, one per line: `name,ip,username`
-3. Load the project.
+1. Create a project: choose where it should live, give it a name and pick a collection method.
+2. Add devices to `hosts.txt` in the project folder, one per line: `name,ip,username`
+3. Load the project by giving the path to its folder.
 
 ## Project layout
 
+A project is a self-contained folder that can live anywhere, e.g. one folder per network
+inside `Documents\netaudit-projects\`. Keep project folders outside this repository.
+
 ```
-projects/<name>/
+<project folder>/
     config.json     project settings
     hosts.txt       devices to audit (no passwords)
     project.log     log of everything the tool has done

@@ -8,7 +8,7 @@ venv/
 
 # Project data: contains device configs, inventories and logs from real/lab networks.
 # Never commit these.
-projects/
+projects/   # in case someone creates projects inside the repo
 *.log
 
 # Secrets

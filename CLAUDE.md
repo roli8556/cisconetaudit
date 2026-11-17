@@ -13,8 +13,10 @@ in a real network, not just a lab toy.
   changes small enough to understand. Prefer clear OOP structure over clever one-liners.
 
 ## Design decisions so far
-- Project-based: each network is a folder under `projects/` with config.json, hosts.txt,
-  project.log, scans/, configs/. `Project.create()` / `Project.load()` in netaudit/project.py.
+- Project-based: a project is a self-contained folder that can live ANYWHERE on disk (the user
+  keeps them outside the repo, one folder per network). It contains config.json, hosts.txt,
+  project.log, scans/, configs/. The tool loads a project by path: `Project.create(parent, name)`
+  / `Project.load(path)` in netaudit/project.py, `python main.py --load PATH` on the CLI.
 - hosts.txt format: `name,ip,username` — passwords are NOT stored on disk (prompt with getpass
   for now; Windows Credential Manager via `keyring` later).
 - Collection method per project: "ssh" or "snmp". SSH is needed for config audits; SNMP can't read
