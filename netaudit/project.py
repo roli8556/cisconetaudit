@@ -1,37 +1,35 @@
 """
 Project: a folder holding everything for one network you audit.
 
-    projects/<name>/
-        config.json     settings for this project (collection method etc.)
-        hosts.txt       the devices to audit
+    <any folder>/<name>/
+        config.json     settings for this project (collection method etc.) - not secret
+        hosts.enc       the devices to audit, with credentials - encrypted with the project password
         project.log     everything the tool has done in this project
+        known_hosts     accepted SSH host keys (public keys - not secret)
         scans/          saved scan results
-        configs/        saved device configurations
+        configs/        saved device configurations (*.enc) - encrypted with the project password
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from .inventory import Host, load_hosts
+from .inventory import Host, InventoryError, format_hosts, parse_hosts
+from .models import RunningConfig
+from .vault import Vault
 
 CONFIG_FILE = "config.json"
-HOSTS_FILE = "hosts.txt"
+HOSTS_FILE = "hosts.enc"
 LOG_FILE = "project.log"
+KNOWN_HOSTS_FILE = "known_hosts"  # created on first accepted SSH host key
 SUBFOLDERS = ("scans", "configs")
 VALID_METHODS = ("ssh", "snmp")
-
-HOSTS_TEMPLATE = """\
-# One device per line: name,ip,username
-# Passwords are NOT stored here - you'll be asked for them when connecting.
-#
-# Example:
-# SW1,192.168.100.11,admin
-"""
+MIN_PASSWORD_LENGTH = 12
 
 
 class ProjectError(Exception):
@@ -74,20 +72,26 @@ class ProjectConfig:
 class Project:
     """A loaded project. Create one with Project.create() or Project.load()."""
 
-    def __init__(self, path: Path, config: ProjectConfig) -> None:
+    def __init__(self, path: Path, config: ProjectConfig, vault: Vault) -> None:
         self.path = path
         self.config = config
         self.hosts: list[Host] = []
+        self._vault = vault  # keeps the derived key so we can re-save without asking again
         self.log = self._setup_logger()
 
     # ---------- the two ways to get a Project ----------
 
     @classmethod
-    def create(cls, base_dir: Path, name: str, method: str = "ssh") -> "Project":
-        """Create a new project folder with all required files."""
+    def create(cls, base_dir: Path, name: str, password: str, method: str = "ssh") -> "Project":
+        """Create a new project folder with all required files.
+
+        password protects hosts.enc. It is never stored - forget it and the host list is gone.
+        """
         path = base_dir / name
         if path.exists():
             raise ProjectError(f"A project already exists at {path}")
+        if len(password) < MIN_PASSWORD_LENGTH:
+            raise ProjectError(f"Project password must be at least {MIN_PASSWORD_LENGTH} characters")
 
         config = ProjectConfig(name=name, collection_method=method)
         config.validate()
@@ -95,16 +99,19 @@ class Project:
         path.mkdir(parents=True)
         for folder in SUBFOLDERS:
             (path / folder).mkdir()
-        (path / HOSTS_FILE).write_text(HOSTS_TEMPLATE, encoding="utf-8")
         config.save(path / CONFIG_FILE)
 
-        project = cls(path, config)
+        project = cls(path, config, Vault.new(password))
+        project.save_hosts()  # writes an empty, encrypted hosts.enc
         project.log.info("Project created (method: %s)", method)
         return project
 
     @classmethod
-    def load(cls, path: Path) -> "Project":
-        """Load an existing project, checking that everything is in place."""
+    def load(cls, path: Path, password: str) -> "Project":
+        """Load an existing project, checking that everything is in place.
+
+        Raises vault.WrongPasswordError if the password is wrong.
+        """
         missing = cls.check_structure(path)
         if missing:
             raise ProjectError(
@@ -112,10 +119,72 @@ class Project:
             )
 
         config = ProjectConfig.from_file(path / CONFIG_FILE)
-        project = cls(path, config)
-        project.hosts = load_hosts(path / HOSTS_FILE)
+        vault, plaintext = Vault.unlock(path / HOSTS_FILE, password)
+        project = cls(path, config, vault)
+        project.hosts = parse_hosts(plaintext)
         project.log.info("Project loaded with %d host(s)", len(project.hosts))
         return project
+
+    # ---------- managing hosts ----------
+
+    def save_hosts(self) -> None:
+        """Encrypt the current host list and write it to hosts.enc."""
+        self._vault.write(self.path / HOSTS_FILE, format_hosts(self.hosts))
+
+    def add_hosts(self, new_hosts: list[Host]) -> None:
+        """Add hosts and save. All-or-nothing: if any IP already exists, nothing is added."""
+        existing = {h.ip for h in self.hosts}  # set comprehension -> fast "in" lookups
+        duplicates = [h.ip for h in new_hosts if h.ip in existing]
+        if duplicates:
+            raise InventoryError(f"Already in the project: {', '.join(duplicates)}")
+        self.hosts.extend(new_hosts)
+        self.save_hosts()
+        for host in new_hosts:
+            self.log.info("Host added: %s (user %s)", host.ip, host.username)  # never the password
+
+    def remove_host(self, ip: str) -> None:
+        remaining = [h for h in self.hosts if h.ip != ip]
+        if len(remaining) == len(self.hosts):
+            raise InventoryError(f"No host with IP {ip}")
+        self.hosts = remaining
+        self.save_hosts()
+        self.log.info("Host removed: %s", ip)
+
+    # ---------- device configs ----------
+
+    def save_config(self, config: RunningConfig) -> Path:
+        """Encrypt a running-config and store it as configs/<hostname>_<ip>_<timestamp>.enc.
+
+        Encrypted because configs contain password hashes, SNMP communities, keys etc.
+        The IP is part of the name because many devices share default hostnames ("Switch").
+        Every fetch gets a new file, so old configs are kept for comparison.
+        """
+        stamp = config.collected_at.strftime("%Y-%m-%dT%H-%M-%S")  # no ":" - invalid on Windows
+        # IPv6 has ":" too, and the hostname comes from the device - so whitelist the characters
+        safe_ip = config.host_ip.replace(":", "-")
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", config.hostname) or "unknown"
+        path = self.configs_dir / f"{safe_name}_{safe_ip}_{stamp}.enc"
+        self._vault.write(path, config.text)
+        self.log.info("Running-config saved: %s -> %s", config.host_ip, path.name)
+        return path
+
+    def list_configs(self) -> list[Path]:
+        """All saved configs, sorted by name (= by hostname, then IP, then time)."""
+        return sorted(self.configs_dir.glob("*.enc"))
+
+    def read_config(self, path: Path) -> str:
+        """Decrypt a saved config with the project key."""
+        return self._vault.read(path)
+
+    @property
+    def configs_dir(self) -> Path:
+        """@property makes this a method you use like an attribute: project.configs_dir
+        (a read-only getter, without the () of a C++ getter)."""
+        return self.path / "configs"
+
+    @property
+    def known_hosts_path(self) -> Path:
+        return self.path / KNOWN_HOSTS_FILE
 
     # ---------- helpers ----------
 

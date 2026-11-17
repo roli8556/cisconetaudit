@@ -14,11 +14,13 @@ in a real network, not just a lab toy.
 
 ## Design decisions so far
 - Project-based: a project is a self-contained folder that can live ANYWHERE on disk (the user
-  keeps them outside the repo, one folder per network). It contains config.json, hosts.txt,
+  keeps them outside the repo, one folder per network). It contains config.json, hosts.enc,
   project.log, scans/, configs/. The tool loads a project by path: `Project.create(parent, name)`
   / `Project.load(path)` in netaudit/project.py, `python main.py --load PATH` on the CLI.
-- hosts.txt format: `name,ip,username` — passwords are NOT stored on disk (prompt with getpass
-  for now; Windows Credential Manager via `keyring` later).
+- Inventory is `hosts.enc`: plaintext `ip username password [enable_password]` per line (whitespace
+  separated, no spaces in fields, IPv4/IPv6), encrypted with a per-project password (scrypt + Fernet, netaudit/vault.py). The
+  project password is never stored; asked with getpass on create/load. Never log/print passwords
+  (Host.password has repr=False). Maybe later: cache project password in Credential Manager (keyring).
 - Collection method per project: "ssh" or "snmp". SSH is needed for config audits; SNMP can't read
   configs but is the right tool for traffic/interface counters.
 - Architecture goal: collectors/adapters (SSH now; Catalyst Center API later) feed a common data
@@ -28,8 +30,16 @@ in a real network, not just a lab toy.
 - Audit rules should be port-role aware (access vs trunk/uplink) to avoid false positives, and
   reference CIS benchmark / Cisco hardening guides.
 
+- Collectors live in netaudit/collectors/ (only place that imports netmiko) and return objects from
+  netaudit/models.py (e.g. RunningConfig). Project.save_config() stores them in configs/.
+- netmiko works fine with IOL (verified 2026-11-17); the chacha20 quirk only affects OpenSSH clients.
+- Host keys: per-project known_hosts, TOFU. collectors/hostkeys.py pre-checks the key (clear error),
+  then netmiko connects with ssh_strict=True + alt_key_file as a second check. The collector asks
+  via an injected confirm_new_key callback - collectors never call input()/print().
+- Saved configs are vault-encrypted (configs/*.enc), same key as hosts.enc (Vault.read/write).
+
 ## Planned stack
-Python 3.12+, netmiko (SSH), ciscoconfparse2 (config parsing), later nornir, pysnmp, pytest.
+Python 3.12+, cryptography, netmiko (SSH), ciscoconfparse2 (config parsing), later nornir, pysnmp, pytest.
 
 ## Lab environment
 - Windows laptop with Hyper-V, Cisco Modeling Labs (CML Free, 5-node limit) as a VM.

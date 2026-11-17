@@ -1,1 +1,2 @@
-# No external dependencies yet. Next: netmiko (SSH to devices).
+cryptography>=44.0
+netmiko>=4.4
