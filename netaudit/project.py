@@ -2,7 +2,7 @@
 Project: a folder holding everything for one network you audit.
 
     <any folder>/<name>/
-        config.json     settings for this project (collection method etc.) - not secret
+        config.json     settings for this project (SSH port/timeout, syslog server) - not secret
         hosts.enc       the devices to audit, with credentials - encrypted with the project password
         project.log.enc everything the tool has done in this project - encrypted line by line
         known_hosts     accepted SSH host keys (public keys - not secret)
@@ -14,8 +14,12 @@ from __future__ import annotations
 
 import json
 import logging
+import logging.handlers  # the handlers (SysLogHandler...) are a separate module in the package
+import os
 import re
-from dataclasses import asdict, dataclass, field
+import socket
+import sys
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
@@ -29,8 +33,20 @@ HOSTS_FILE = "hosts.enc"
 LOG_FILE = "project.log.enc"  # one encrypted token per line, see EncryptedFileHandler
 KNOWN_HOSTS_FILE = "known_hosts"  # created on first accepted SSH host key
 SUBFOLDERS = ("scans", "configs")
-VALID_METHODS = ("ssh", "snmp")
-MIN_PASSWORD_LENGTH = 12
+
+# configs/<hostname>_<ip>_<timestamp>[_<n>].enc - see Project.save_config(). The hostname may
+# contain "_", the IP never does (IPv6 colons become "-"), so the IP is the part before the time.
+_CONFIG_NAME = re.compile(
+    r"(?P<name>.+)_(?P<ip>[^_]+)_(?P<stamp>\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})(?:_(?P<n>\d+))?"
+)
+
+
+_NEW, _OLD = ".pwchange-new", ".pwchange-old"  # temporary suffixes while the password changes
+
+
+def _staged(file: Path, suffix: str) -> Path:
+    """hosts.enc -> hosts.enc.pwchange-new (same folder)."""
+    return file.with_name(file.name + suffix)
 
 
 def _unique_path(path: Path) -> Path:
@@ -74,37 +90,58 @@ class EncryptedFileHandler(logging.Handler):
             self.handleError(record)  # logging must never crash the program
 
 
+class QuietSysLogHandler(logging.handlers.SysLogHandler):
+    """Python's SysLogHandler, but a failed send doesn't print a traceback into the menu.
+
+    By default a broken handler prints "--- Logging error ---" plus a traceback to the console
+    on EVERY log line - unusable when the syslog server is just down. Here the first error is
+    remembered (shown in the settings menu) and the line is still in the encrypted local log.
+    """
+
+    def __init__(self, host: str, port: int, protocol: str, project_name: str) -> None:
+        socktype = socket.SOCK_STREAM if protocol == "tcp" else socket.SOCK_DGRAM
+        # The base class connects here for TCP - an unreachable server raises OSError right away.
+        super().__init__(address=(host, port), facility=self.LOG_LOCAL0, socktype=socktype)
+        self.last_error = ""
+        # Python ends each message with a NUL byte by default (for very old daemons); modern
+        # servers show it as "#000". Over TCP, servers split messages on newlines instead.
+        self.append_nul = False
+        end = "\n" if protocol == "tcp" else ""
+        self.setFormatter(logging.Formatter(f"netaudit[{project_name}]: %(levelname)s %(message)s{end}"))
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        # sys.exc_info() is "the exception being handled right now" - like std::current_exception
+        self.last_error = str(sys.exc_info()[1])
+
+
 @dataclass
 class ProjectConfig:
     """The contents of config.json. A dataclass auto-generates __init__ etc."""
 
     name: str
-    collection_method: str = "ssh"
     created: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     ssh_port: int = 22
     ssh_timeout: int = 10
-    snmp_port: int = 161
-    snmp_version: str = "3"
-
-    def validate(self) -> None:
-        if self.collection_method not in VALID_METHODS:
-            raise ProjectError(
-                f"collection_method must be one of {VALID_METHODS}, got '{self.collection_method}'"
-            )
+    syslog_host: str = ""  # "" = don't send the log to a syslog server
+    syslog_port: int = 514
+    syslog_protocol: str = "udp"  # "udp" or "tcp"
 
     def save(self, path: Path) -> None:
         path.write_text(json.dumps(asdict(self), indent=4), encoding="utf-8")
 
     @classmethod
     def from_file(cls, path: Path) -> "ProjectConfig":
-        """Alternative constructor - like a static factory method in C++."""
+        """Alternative constructor - like a static factory method in C++.
+
+        Settings this version doesn't know are ignored, so projects created by older versions
+        (e.g. with "collection_method" / "snmp_port") still load.
+        """
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            config = cls(**data)
-        except (json.JSONDecodeError, TypeError) as exc:
+            known = {f.name for f in fields(cls)}  # fields() lists a dataclass's fields
+            return cls(**{key: value for key, value in data.items() if key in known})
+        except (json.JSONDecodeError, TypeError, AttributeError) as exc:
             raise ProjectError(f"config.json is invalid: {exc}") from exc
-        config.validate()
-        return config
 
 
 class Project:
@@ -120,19 +157,17 @@ class Project:
     # ---------- the two ways to get a Project ----------
 
     @classmethod
-    def create(cls, base_dir: Path, name: str, password: str, method: str = "ssh") -> "Project":
+    def create(cls, base_dir: Path, name: str, password: str) -> "Project":
         """Create a new project folder with all required files.
 
-        password protects hosts.enc. It is never stored - forget it and the host list is gone.
+        password encrypts hosts.enc, the saved configs, scan reports and the log. It is never
+        stored - forget it and all of that is unreadable.
         """
         path = base_dir / name
         if path.exists():
             raise ProjectError(f"A project already exists at {path}")
-        if len(password) < MIN_PASSWORD_LENGTH:
-            raise ProjectError(f"Project password must be at least {MIN_PASSWORD_LENGTH} characters")
 
-        config = ProjectConfig(name=name, collection_method=method)
-        config.validate()
+        config = ProjectConfig(name=name)
 
         path.mkdir(parents=True)
         for folder in SUBFOLDERS:
@@ -141,7 +176,7 @@ class Project:
 
         project = cls(path, config, Vault.new(password))
         project.save_hosts()  # writes an empty, encrypted hosts.enc
-        project.log.info("Project created (method: %s)", method)
+        project.log.info("Project created")
         return project
 
     @classmethod
@@ -150,6 +185,7 @@ class Project:
 
         Raises vault.WrongPasswordError if the password is wrong.
         """
+        cls.recover_password_change(path)  # must run first: it can restore hosts.enc
         missing = cls.check_structure(path)
         if missing:
             raise ProjectError(
@@ -210,6 +246,31 @@ class Project:
         """All saved configs, sorted by name (= by hostname, then IP, then time)."""
         return sorted(self.configs_dir.glob("*.enc"))
 
+    def config_versions(self) -> dict[str, list[Path]]:
+        """Saved configs per device: {ip: [oldest ... newest]}.
+
+        Grouped by IP, not hostname: a renamed switch keeps its history. Files whose name
+        doesn't follow the netaudit pattern are left out (and never deleted).
+        """
+        versions: dict[str, list[tuple[tuple, Path]]] = {}
+        for path in self.configs_dir.glob("*.enc"):
+            match = _CONFIG_NAME.fullmatch(path.stem)
+            if match:
+                # sort key: timestamp, then the _2/_3 counter for two saves in the same second
+                order = (match["stamp"], int(match["n"] or 1))
+                versions.setdefault(match["ip"], []).append((order, path))
+        return {ip: [path for _, path in sorted(items)] for ip, items in sorted(versions.items())}
+
+    def old_configs(self) -> list[Path]:
+        """Every saved config except the newest one of each device."""
+        return [path for paths in self.config_versions().values() for path in paths[:-1]]
+        # paths[:-1] = all but the last element (a slice, like a sub-range in C++)
+
+    def delete_configs(self, paths: list[Path]) -> None:
+        for path in paths:
+            path.unlink()  # unlink = delete a file
+        self.log.info("Deleted %d old config(s): %s", len(paths), ", ".join(p.name for p in paths))
+
     def read_config(self, path: Path) -> str:
         """Decrypt a saved config with the project key."""
         return self._vault.read(path)
@@ -265,20 +326,123 @@ class Project:
     def read_scan(self, path: Path) -> ScanReport:
         return ScanReport.from_dict(json.loads(self._vault.read(path)))
 
+    # ---------- changing the password ----------
+
+    def check_password(self, password: str) -> bool:
+        """Is this the project password? (Runs scrypt once - takes about half a second.)"""
+        try:
+            Vault.unlock(self.path / HOSTS_FILE, password)
+            return True
+        except VaultError:  # also catches WrongPasswordError, its subclass
+            return False
+
+    def change_password(self, current: str, new: str) -> int:
+        """Re-encrypt every encrypted file with a key from the new password. Returns the number
+        of files re-encrypted. Raises WrongPasswordError if current is wrong.
+
+        Crash-safe in three phases (see recover_password_change for the other half):
+          1. write every file re-encrypted as <file>.pwchange-new - originals untouched
+          2. swap: <file> -> <file>.pwchange-old, <file>.pwchange-new -> <file>
+          3. delete the .pwchange-old files
+        """
+        old_vault, _ = Vault.unlock(self.path / HOSTS_FILE, current)  # proves the current password
+        new_vault = Vault.new(new)  # new random salt too
+        log_file = self.path / LOG_FILE
+        files = [self.path / HOSTS_FILE, *self.list_configs(), *self.list_scans()]
+
+        # Phase 1: prepare. Any error -> remove what was prepared; nothing has changed.
+        staged: list[Path] = []
+        try:
+            for file in files:
+                new_vault.write(_staged(file, _NEW), old_vault.read(file))
+                staged.append(file)
+            if log_file.is_file():
+                lines = []
+                for token in log_file.read_text(encoding="ascii").splitlines():
+                    try:
+                        lines.append(new_vault.encrypt_line(old_vault.decrypt_line(token)))
+                    except VaultError:
+                        lines.append(token)  # already unreadable - keep it as it is
+                _staged(log_file, _NEW).write_text("".join(line + "\n" for line in lines), encoding="ascii")
+                staged.append(log_file)
+        except Exception:
+            for file in staged:
+                _staged(file, _NEW).unlink(missing_ok=True)
+            raise  # re-raise the same exception for the caller
+
+        # Phase 2: swap (quick renames). Phase 3: clean up.
+        for file in staged:
+            os.replace(file, _staged(file, _OLD))
+            os.replace(_staged(file, _NEW), file)
+        for file in staged:
+            _staged(file, _OLD).unlink()
+
+        # From now on, everything (including new log lines) uses the new key.
+        self._vault = new_vault
+        self.log = self._setup_logger()
+        self.log.info("Project password changed - %d file(s) re-encrypted", len(staged))
+        return len(staged)
+
+    @staticmethod
+    def recover_password_change(path: Path) -> str:
+        """Finish or undo a password change that was interrupted (crash, power cut).
+        Returns a message for the user, or "" if there was nothing to recover.
+
+        Leftover .pwchange-new files = the swap didn't finish -> roll back to the OLD password.
+        Only .pwchange-old files left = the swap finished    -> keep the NEW password.
+        """
+        new_files = list(path.rglob(f"*{_NEW}"))  # rglob = search all subfolders too
+        old_files = list(path.rglob(f"*{_OLD}"))
+        if not new_files and not old_files:
+            return ""
+        if new_files:
+            for old in old_files:
+                os.replace(old, old.with_name(old.name.removesuffix(_OLD)))
+            for new in new_files:
+                new.unlink()
+            return "An interrupted password change was undone - the OLD project password is still valid."
+        for old in old_files:
+            old.unlink()
+        return "An interrupted password change was completed - the NEW project password is valid."
+
     # ---------- logging ----------
 
+    def save_settings(self) -> None:
+        """Write config.json and rebuild the logger, so e.g. a new syslog server is used at once."""
+        self.config.save(self.path / CONFIG_FILE)
+        self.log = self._setup_logger()
+
+    @property
+    def syslog_error(self) -> str:
+        """Why syslog isn't working, or "" if it is (or isn't configured)."""
+        if self._syslog_setup_error:
+            return self._syslog_setup_error
+        handler = next((h for h in self.log.handlers if isinstance(h, QuietSysLogHandler)), None)
+        return handler.last_error if handler else ""
+
     def _setup_logger(self) -> logging.Logger:
-        """Each project gets its own logger writing to its own encrypted log file."""
+        """Each project gets its own logger: always the encrypted log file, and a syslog server
+        too if one is configured. One logger, several handlers - every line goes to all of them."""
         logger = logging.getLogger(f"netaudit.{self.config.name}")
         logger.setLevel(logging.INFO)
-        for old in logger.handlers:  # if the project is reloaded, close the old file handler
+        for old in logger.handlers:  # if the project is reloaded, close the old handlers
             old.close()
         logger.handlers.clear()
         handler = EncryptedFileHandler(self.path / LOG_FILE, self._vault)
         handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s"))
         logger.addHandler(handler)
         logger.propagate = False  # don't also pass records to the root logger (e.g. the console)
+
+        self._syslog_setup_error = ""
+        if self.config.syslog_host:
+            try:
+                logger.addHandler(QuietSysLogHandler(
+                    self.config.syslog_host, self.config.syslog_port, self.config.syslog_protocol, self.config.name))
+            except OSError as exc:  # TCP: server unreachable; any protocol: name doesn't resolve
+                self._syslog_setup_error = str(exc)
+                logger.warning("Syslog server %s:%d/%s unreachable: %s - logging locally only",
+                               self.config.syslog_host, self.config.syslog_port, self.config.syslog_protocol, exc)
         return logger
 
     def __repr__(self) -> str:
-        return f"Project(name={self.config.name!r}, method={self.config.collection_method!r}, hosts={len(self.hosts)})"
+        return f"Project(name={self.config.name!r}, hosts={len(self.hosts)})"

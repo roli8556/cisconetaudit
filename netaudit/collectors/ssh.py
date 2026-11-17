@@ -44,6 +44,7 @@ SNAPSHOT_COMMANDS = [
     "show ip ospf neighbor",
     "show ntp status",
     "show crypto key mypubkey rsa",
+    "show ip dhcp snooping binding",
 ]
 
 # Changes are made with "configure terminal revert timer": if we can't confirm them within this

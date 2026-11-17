@@ -1,5 +1,6 @@
 """
-Vault: password-based encryption for project files that contain secrets (hosts.enc).
+Vault: password-based encryption for everything sensitive in a project: hosts.enc (credentials),
+configs/*.enc, scans/*.enc and project.log.enc (one encrypted token per line).
 
 How a password becomes an encrypted file:
 

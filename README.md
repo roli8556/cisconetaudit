@@ -20,11 +20,13 @@ traffic to find congestion and suggest improvements to STP, HSRP and ACLs.
       plus DTP (negotiated links, edge ports) and unhardened unused ports (parking VLAN)
       and management settings: hostname, same domain name everywhere, logging synchronous,
       NTP configured + synchronized + same time source, syslog server
+      and edge-port security: port security, PortFast, BPDU Guard, DHCP snooping and DAI
+      (with rate limits and full validation), errdisable recovery
 - [ ] Static security audit with rules mapped to CIS / Cisco hardening guides
 - [ ] Reports with findings and suggested config changes
 - [x] Apply fixes: show commands only, step by step with confirmation, or all at once - with
       automatic rollback (`configure terminal revert timer`) and a re-scan to verify
-- [ ] Traffic monitoring over SNMP and live analysis
+- [ ] Traffic monitoring and live analysis (over SSH: interface counters, STP/HSRP state)
 
 ## Usage
 
@@ -33,9 +35,9 @@ python main.py                                   # interactive menu
 python main.py --load "C:\path\to\my-project"   # load a project directly
 ```
 
-1. Create a project: choose where it should live, give it a name, pick a collection method and
+1. Create a project: choose where it should live, give it a name and
    set a project password (min 12 characters - it can't be recovered).
-2. Load the project (path + project password) and add devices from the menu, or import a
+2. Load the project (pick it from the recent projects list, or give its path; then the project password) and add devices from the menu, or import a
    plaintext file with one device per line: `ip username password [enable_password]`
    (IPv4 or IPv6; no spaces in any field; enable password only if the account doesn't log in at
    privilege 15). Delete the plaintext file afterwards - the tool offers to do it.
@@ -86,6 +88,8 @@ high-value target.
   project password (scrypt, ~128 MB / ~0.5 s per guess) using Fernet (AES + HMAC-SHA256).
   The project password itself is never stored. Its strength is what protects the credentials.
 - Passwords are never written to logs or printed.
+- The project log can also be sent to a syslog server (Settings menu, UDP or TCP). Syslog is
+  unencrypted on the network: it contains device IPs, usernames and applied commands, never passwords.
 - Configs are fetched only at privilege level 15 (lower levels show a partial config, which
   would give false audit results).
 - Saved configs (`configs/*.enc`) are encrypted with the same project key as `hosts.enc`, since

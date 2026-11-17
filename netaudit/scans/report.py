@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
-from ..models import Finding, Fix, FixInput, FixTarget
+from ..models import Finding, Fix, FixInput, FixQuestion, FixTarget
 
 
 @dataclass
@@ -74,7 +74,10 @@ class ScanReport:
 def _fix_input(data: dict | None) -> FixInput | None:
     if data is None:
         return None
-    return FixInput(**{**data, "targets": [FixTarget(**t) for t in data["targets"]]})
+    return FixInput(**{**data,
+                       "targets": [FixTarget(**t) for t in data["targets"]],
+                       "followups": [FixQuestion(**q) for q in data.get("followups", [])]})
+    # .get(..., []): reports saved before follow-up questions existed don't have the key
 
 
 def format_finding(number: int, finding: Finding, with_commands: bool = False) -> str:
@@ -97,4 +100,6 @@ def format_finding(number: int, finding: Finding, with_commands: bool = False) -
             default = f" (suggested: {finding.fix_input.default})" if finding.fix_input.default else ""
             devices = sorted({t.hostname for t in finding.fix_input.targets})
             lines.append(f"       Needs a value: {finding.fix_input.question}{default} - changes {', '.join(devices)}")
+            for question in finding.fix_input.followups:
+                lines.append(f"       + {question.question} (suggested: {question.default})")
     return "\n".join(lines)

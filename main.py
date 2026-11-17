@@ -18,13 +18,14 @@ from pathlib import Path
 from netaudit.collectors.hostkeys import KnownHosts
 from netaudit.collectors.ssh import REVERT_MINUTES, CollectorError, SshCollector
 from netaudit.inventory import Host, InventoryError, parse_hosts, validate_host
-from netaudit.project import MIN_PASSWORD_LENGTH, VALID_METHODS, Project, ProjectError
-from netaudit.models import Finding
+from netaudit.project import Project, ProjectError
+from netaudit.models import Finding, FixQuestion
+from netaudit.recent import RecentProjects, default_file
 from netaudit.scans import fix_inputs
 from netaudit.scans.remediation import apply_fixes, commands_per_device, phases, save_to_startup
 from netaudit.scans.report import ScanReport, format_finding
 from netaudit.scans.runner import run_baseline
-from netaudit.vault import VaultError
+from netaudit.vault import VaultError, WrongPasswordError
 
 BANNER = """
 ███    ██ ███████ ████████  █████  ██    ██ ██████  ██ ████████
@@ -44,12 +45,7 @@ def ask_path(prompt: str, default: Path | None = None) -> Path:
     return Path(answer).expanduser()
 
 
-def ask_method() -> str:
-    while True:
-        method = input(f"Collection method {VALID_METHODS}: ").strip().lower()
-        if method in VALID_METHODS:
-            return method
-        print(f"  Please type one of: {', '.join(VALID_METHODS)}")
+MIN_PASSWORD_LENGTH = 12
 
 
 def ask_new_password() -> str:
@@ -67,28 +63,65 @@ def ask_new_password() -> str:
 
 # ---------- project actions (work without a loaded project) ----------
 
-def create_project() -> Project | None:
-    parent = ask_path("Folder to create the project in", default=Path.cwd())
+def prompt_create_project() -> Project | None:
+    """Ask for folder, name and password, then let Project.create() make the project."""
+    # Suggest the folder the most recent project lives in - projects are usually kept together
+    recent = RECENT.entries
+    default_parent = Path(recent[0].path).parent if recent else Path.cwd()
+    parent = ask_path("Folder to create the project in", default=default_parent)
     name = input("Project name: ").strip()
     if not name:
         print("  Name can't be empty.")
         return None
-    method = ask_method()
-    print("  The project password encrypts hosts.enc. It can't be recovered if you forget it.")
+    print("  The project password encrypts everything sensitive in the project: device credentials,")
+    print("  saved configs, scan reports and the log. It can't be recovered if you forget it -")
+    print("  without it, none of that data can be read.")
     password = ask_new_password()
     try:
-        project = Project.create(parent, name, password, method)
+        project = Project.create(parent, name, password)
     except (ProjectError, OSError) as exc:
         print(f"  Error: {exc}")
         return None
     print(f"  Created {project.path.resolve()}")
     print("  Next: add devices with 'Add host' or 'Import hosts from file'.")
+    RECENT.remember(project.path, project.config.name)
     return project
 
 
-def load_project(path: Path | None = None) -> Project | None:
+def choose_project_path() -> Path | None:
+    """Pick a recently used project, or type a path. None = cancelled."""
+    while True:
+        if not RECENT.entries:
+            return ask_path("Path to project folder")
+        print("  Recent projects:")
+        for number, entry in enumerate(RECENT.entries, start=1):
+            missing = "" if entry.exists else "   (not found - moved, deleted or drive not connected?)"
+            print(f"    {number:>2}) {entry.name:<20} {entry.path}{missing}")
+        print("     p) Enter a path   r) Remove a project from this list   b) Back")
+        choice = input("  > ").strip().lower()
+        if choice == "b":
+            return None
+        if choice == "p":
+            return ask_path("Path to project folder")
+        if choice == "r":
+            number = input("  Number to remove from the list (the folder itself is not touched): ").strip()
+            if number.isdigit() and 1 <= int(number) <= len(RECENT.entries):
+                RECENT.forget(RECENT.entries[int(number) - 1])
+            continue  # show the list again
+        if choice.isdigit() and 1 <= int(choice) <= len(RECENT.entries):
+            return Path(RECENT.entries[int(choice) - 1].path)
+        print("  Unknown choice.")
+
+
+def prompt_load_project(path: Path | None = None) -> Project | None:
+    """Pick a project (or use path, from --load) and its password, then let Project.load() open it."""
     if path is None:
-        path = ask_path("Path to project folder")
+        path = choose_project_path()
+        if path is None:
+            return None
+    # Before asking: an interrupted password change decides WHICH password is valid
+    if path.is_dir() and (message := Project.recover_password_change(path)):
+        print(f"  NOTE: {message}")
     password = getpass("Project password: ")
     print("  Unlocking...")  # scrypt takes a moment - that's the point
     try:
@@ -97,6 +130,7 @@ def load_project(path: Path | None = None) -> Project | None:
         print(f"  Error: {exc}")
         return None
     print(f"  Loaded: {project}")
+    RECENT.remember(project.path, project.config.name)  # only after a successful load
     return project
 
 
@@ -128,10 +162,7 @@ def add_host(project: Project) -> None:
 
 
 def make_collector(project: Project) -> SshCollector | None:
-    """An SshCollector for this project, or None (with a message) if SSH can't be used."""
-    if project.config.collection_method != "ssh":
-        print("  This needs SSH (this project uses SNMP).")
-        return None
+    """An SshCollector for this project, or None (with a message) if there are no hosts."""
     if not project.hosts:
         print("  No hosts yet.")
         return None
@@ -176,13 +207,29 @@ def choose_file(files: list[Path], what: str) -> Path | None:
     return files[int(choice) - 1]
 
 
+def choose_hosts(project: Project) -> list[Host]:
+    """Let the user pick hosts: Enter = all, or numbers like "2" or "1,3"."""
+    for number, host in enumerate(project.hosts, start=1):
+        print(f"    {number:>3}) {host.ip:<16} user: {host.username}")
+    while True:
+        answer = input("  Hosts to fetch (e.g. 2 or 1,3 - Enter = all): ").strip()
+        if not answer:
+            return list(project.hosts)
+        parts = [p.strip() for p in answer.split(",")]
+        if all(p.isdigit() and 1 <= int(p) <= len(project.hosts) for p in parts):
+            # dict.fromkeys() removes duplicates ("1,1") but keeps the order - a set wouldn't
+            return [project.hosts[int(p) - 1] for p in dict.fromkeys(parts)]
+        print(f"  Enter numbers between 1 and {len(project.hosts)}, separated by commas.")
+
+
 def fetch_configs(project: Project) -> None:
-    """Fetch the running-config from every host and save it in configs/."""
+    """Fetch the running-config from the chosen hosts and save it (encrypted) in configs/."""
     collector = make_collector(project)
     if collector is None:
         return
+    hosts = choose_hosts(project)
     ok = 0
-    for host in project.hosts:
+    for host in hosts:
         print(f"  {host.ip}")
         try:
             config = collector.fetch_running_config(host)
@@ -193,7 +240,40 @@ def fetch_configs(project: Project) -> None:
         path = project.save_config(config)
         print(f"    OK  {config.hostname} -> configs/{path.name}")
         ok += 1
-    print(f"  Done: {ok}/{len(project.hosts)} config(s) saved.")
+    print(f"  Done: {ok}/{len(hosts)} config(s) saved.")
+
+
+def configs_menu(project: Project) -> None:
+    actions = {"1": view_config, "2": remove_old_configs}
+    while True:
+        versions = project.config_versions()
+        total = sum(len(paths) for paths in versions.values())
+        print(f"\n=== netaudit | project: {project.config.name} | saved configs ===")
+        print(f"  {total} config(s) from {len(versions)} device(s)")
+        print("1) View a config\n2) Remove old versions (keep the newest per device)\nb) Back")
+        choice = input("> ").strip().lower()
+        if choice == "b":
+            return
+        if choice in actions:
+            actions[choice](project)
+        else:
+            print("  Unknown choice.")
+
+
+def remove_old_configs(project: Project) -> None:
+    old = project.old_configs()
+    if not old:
+        print("  Nothing to remove - every device has only one saved config.")
+        return
+    print(f"  {len(old)} older config(s) will be deleted; the newest per device is kept:")
+    for ip, paths in project.config_versions().items():
+        if len(paths) > 1:
+            print(f"    {ip:<16} keep {paths[-1].stem}, delete {len(paths) - 1} older")
+    if not ask_yes_no("  Delete them? This can't be undone"):
+        print("  Nothing deleted.")
+        return
+    project.delete_configs(old)
+    print(f"  Deleted {len(old)} config(s).")
 
 
 def view_config(project: Project) -> None:
@@ -210,6 +290,116 @@ def view_config(project: Project) -> None:
 def view_log(project: Project) -> None:
     lines = project.read_log()
     print("\n".join(lines) if lines else "  The log is empty.")
+
+
+# ---------- settings ----------
+
+def settings_menu(project: Project) -> None:
+    actions = {"1": set_syslog_server, "2": disable_syslog, "3": send_syslog_test, "4": set_ssh_options,
+               "5": change_password}
+    while True:
+        cfg = project.config
+        print(f"\n=== netaudit | project: {cfg.name} | settings ===")
+        if cfg.syslog_host:
+            status = f"ERROR: {project.syslog_error}" if project.syslog_error else "active"
+            print(f"  Syslog server: {cfg.syslog_host}:{cfg.syslog_port} ({cfg.syslog_protocol.upper()}) - {status}")
+        else:
+            print("  Syslog server: not set (log is only kept in the encrypted local file)")
+        print(f"  SSH: port {cfg.ssh_port}, timeout {cfg.ssh_timeout} s")
+        print("1) Set syslog server\n2) Turn syslog off\n3) Send a syslog test message\n4) SSH port and timeout")
+        print("5) Change project password\nb) Back")
+        choice = input("> ").strip().lower()
+        if choice == "b":
+            return
+        if choice in actions:
+            actions[choice](project)
+        else:
+            print("  Unknown choice.")
+
+
+def ask_number(prompt: str, default: int, low: int, high: int) -> int:
+    while True:
+        answer = input(f"{prompt} [{default}]: ").strip()
+        if not answer:
+            return default
+        if answer.isdigit() and low <= int(answer) <= high:
+            return int(answer)
+        print(f"  Enter a number between {low} and {high}.")
+
+
+def set_syslog_server(project: Project) -> None:
+    cfg = project.config
+    print("  Note: syslog is sent UNENCRYPTED over the network. The log never contains passwords,")
+    print("  but it does contain device IPs, usernames and the configuration commands applied.")
+    host = input(f"Syslog server (IP or hostname) [{cfg.syslog_host or 'none'}]: ").strip() or cfg.syslog_host
+    if not host:
+        print("  No server given - nothing changed.")
+        return
+    port = ask_number("UDP/TCP port", cfg.syslog_port, 1, 65535)
+    protocol = ""
+    while protocol not in ("udp", "tcp"):
+        protocol = input(f"Protocol udp/tcp [{cfg.syslog_protocol}]: ").strip().lower() or cfg.syslog_protocol
+    cfg.syslog_host, cfg.syslog_port, cfg.syslog_protocol = host, port, protocol
+    project.save_settings()
+    if project.syslog_error:
+        print(f"  Saved, but the server can't be reached: {project.syslog_error}")
+        print("  The log is still written locally. netaudit tries again the next time the project is loaded.")
+    else:
+        project.log.info("Syslog server set to %s:%d/%s", host, port, protocol)
+        print("  Saved. Use 'Send a syslog test message' to check it arrives.")
+
+
+def disable_syslog(project: Project) -> None:
+    if not project.config.syslog_host:
+        print("  Syslog is already off.")
+        return
+    project.log.info("Syslog to %s turned off", project.config.syslog_host)
+    project.config.syslog_host = ""
+    project.save_settings()
+    print("  Syslog turned off.")
+
+
+def send_syslog_test(project: Project) -> None:
+    if not project.config.syslog_host:
+        print("  No syslog server set.")
+        return
+    project.log.info("Syslog test message from netaudit")
+    if project.syslog_error:
+        print(f"  Failed: {project.syslog_error}")
+    elif project.config.syslog_protocol == "udp":
+        print("  Sent. UDP gives no delivery confirmation - check that it arrived on the server.")
+    else:
+        print("  Sent over TCP (the connection accepted it). Check that it arrived on the server.")
+
+
+def change_password(project: Project) -> None:
+    current = getpass("Current project password: ")
+    if not project.check_password(current):  # check now, not after typing the new one twice
+        print("  The current password is wrong - nothing changed.")
+        return
+    print("  Choose the new password.")
+    new = ask_new_password()
+    if new == current:
+        print("  That's the same password - nothing changed.")
+        return
+    print("  Re-encrypting hosts, configs, scan reports and the log...")
+    try:
+        count = project.change_password(current, new)
+    except WrongPasswordError:
+        print("  The current password is wrong - nothing changed.")
+        return
+    except (VaultError, OSError) as exc:
+        print(f"  Error: {exc} - nothing changed, the old password is still valid.")
+        return
+    print(f"  Done: {count} file(s) re-encrypted. Use the new password from now on.")
+
+
+def set_ssh_options(project: Project) -> None:
+    project.config.ssh_port = ask_number("SSH port", project.config.ssh_port, 1, 65535)
+    project.config.ssh_timeout = ask_number("SSH timeout in seconds", project.config.ssh_timeout, 1, 300)
+    project.save_settings()
+    project.log.info("SSH settings changed: port %d, timeout %d s", project.config.ssh_port, project.config.ssh_timeout)
+    print("  Saved.")
 
 
 # ---------- scans ----------
@@ -241,6 +431,8 @@ def baseline_scan(project: Project) -> None:
     if report.findings:
         handle_findings(project, collector, report)
 
+
+RECENT = RecentProjects(default_file())  # module-level: one shared list for the whole program
 
 MAX_SCAN_AGE = timedelta(days=1)  # older reports get a warning before fixes are offered
 
@@ -308,10 +500,23 @@ def ask_fix_value(finding: Finding) -> Finding | None:
         caution = fix_inputs.warning(fix_input, value)
         if caution and not ask_yes_no(f"     WARNING: {caution}. Use this value anyway?"):
             continue  # ask for the value again
-        resolved = fix_inputs.resolve(finding, value)
+        answers = {"value": value}
+        for question in fix_input.followups:
+            answers[question.key] = ask_followup(question)
+        resolved = fix_inputs.resolve(finding, answers)
         for fix in resolved.fixes:  # show exactly what will be sent
             print(f"       {fix.hostname}: " + " | ".join(fix.commands))
         return resolved
+
+
+def ask_followup(question: FixQuestion) -> str:
+    """Ask one follow-up question until the answer is valid. Enter = the suggested default."""
+    while True:
+        value = input(f"     {question.question} (Enter = {question.default}): ").strip() or question.default
+        error = fix_inputs.validate_followup(question, value)
+        if not error:
+            return value
+        print(f"     {error}")
 
 
 def handle_findings(project: Project, collector: SshCollector, report: ScanReport) -> None:
@@ -424,7 +629,7 @@ def start_menu() -> Project | None:
     """Loop until a project is created/loaded (returned) or the user quits (None)."""
     # Dispatch table: functions are objects in Python, so a dict can map a menu key
     # straight to the function to call (like a map of function pointers in C++).
-    actions = {"1": create_project, "2": load_project}
+    actions = {"1": prompt_create_project, "2": prompt_load_project}
 
     while True:
         print("\n=== netaudit ===")
@@ -449,15 +654,16 @@ def project_menu(project: Project) -> None:
         "3": remove_host,
         "4": import_hosts,
         "5": fetch_configs,
-        "6": view_config,
+        "6": configs_menu,
         "7": scan_menu,
         "8": view_log,
+        "9": settings_menu,
     }
 
     while True:
         print(f"\n=== netaudit | project: {project.config.name} ({project.path.resolve()}) ===")
         print("1) List hosts\n2) Add host\n3) Remove host\n4) Import hosts from file")
-        print("5) Fetch running-configs\n6) View saved config\n7) Scan\n8) View log\nq) Quit")
+        print("5) Fetch running-configs\n6) Saved configs\n7) Scan\n8) View log\n9) Settings\nq) Quit")
         choice = input("> ").strip().lower()
 
         if choice == "q":
@@ -479,7 +685,7 @@ def main() -> None:
     print(BANNER)
 
     # --load skips the start menu; if loading fails, fall back to it.
-    project = load_project(args.load) if args.load else None
+    project = prompt_load_project(args.load) if args.load else None
     if project is None:
         project = start_menu()
     if project is not None:

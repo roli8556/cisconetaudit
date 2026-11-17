@@ -23,7 +23,7 @@ from dataclasses import dataclass
 
 from ..models import DeviceSnapshot, Finding, Fix, FixInput, FixTarget, InterfaceState, OspfInterface
 from ..parsers.ios import config_interface_sections, format_vlan_list, parse_vlan_list, short_interface
-from . import management
+from . import l2security, management
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
@@ -614,12 +614,6 @@ def check_dtp_edge_ports(device: DeviceSnapshot, links: list[Link]) -> Iterator[
             )
 
 
-def _is_parked(intf: InterfaceState) -> bool:
-    """Already hardened: shut down, static access, no DTP, not in VLAN 1."""
-    return (intf.status == "administratively down" and intf.admin_mode == "static access"
-            and not intf.dtp and intf.access_vlan not in (None, 1))
-
-
 def check_unused_ports(device: DeviceSnapshot, links: list[Link]) -> Iterator[Finding]:
     """Switchports that are down: shut them, make them static access without DTP, and park them
     in an unused VLAN - so plugging a cable in gives an attacker nothing (CIS Cisco IOS benchmark)."""
@@ -627,7 +621,7 @@ def check_unused_ports(device: DeviceSnapshot, links: list[Link]) -> Iterator[Fi
         intf for intf in device.interfaces.values()
         if intf.is_physical and intf.switchport and not intf.is_up
         and not intf.channel_group  # members are handled with their port-channel
-        and not _is_parked(intf)
+        and not l2security.is_parked(intf)
     ]
     if not unused:
         return
@@ -683,6 +677,8 @@ class BaselineScan:
                 findings.extend(check(device, links))
             for check in management.DEVICE_CHECKS:
                 findings.extend(check(device, snapshots))
+            for check in l2security.DEVICE_CHECKS:
+                findings.extend(check(device, links))
         for check in management.NETWORK_CHECKS:
             findings.extend(check(snapshots))
 

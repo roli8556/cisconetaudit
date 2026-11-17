@@ -22,6 +22,7 @@ Single ports:
     SW1 Et3/3  up, dynamic auto, a PC behind it                  -> DTP on an edge port
     SW2 Et3/0  down, access VLAN 10                              -> unused, not hardened
 Management:
+    SW1  management like the lab: Et0/0 access port in VLAN 99, SVI Vlan99 = 192.168.100.11
     SW1  domain lab.local, NTP synced to 192.168.100.1, syslog, logging synchronous on con only
     SW2  domain lab.example ("ip domain name" syntax), no NTP, no syslog, no logging synchronous
 """
@@ -199,6 +200,10 @@ interface Port-channel1
  switchport trunk allowed vlan 10,99
  switchport mode trunk
 !
+interface Ethernet0/0
+ switchport access vlan 99
+ switchport mode access
+!
 interface Ethernet0/1
  switchport trunk native vlan 99
  switchport trunk allowed vlan 10,20,99
@@ -258,6 +263,9 @@ interface Ethernet3/3
 interface Loopback0
  ip address 1.1.1.1 255.255.255.255
 !
+interface Vlan99
+ ip address 192.168.100.11 255.255.255.0
+!
 router ospf 1
  network 0.0.0.0 255.255.255.255 area 0
 !
@@ -270,6 +278,7 @@ line vty 0 4
 end
 """,
     "show interfaces": "".join([
+        show_interface("Ethernet0/0"),
         show_interface("Ethernet0/1"),
         show_interface("Ethernet0/2"),
         show_interface("Ethernet0/3"),
@@ -285,8 +294,10 @@ end
         show_interface("Ethernet3/2"),
         show_interface("Ethernet3/3"),
         show_interface("Port-channel1", status="down"),
+        show_interface("Vlan99", ip="192.168.100.11/24"),
     ]),
     "show interfaces switchport": "".join([
+        switchport("Et0/0", "static access", "static access", access=99),
         switchport("Et0/1", "trunk", "trunk", native=99, allowed="10,20,99"),
         switchport("Et0/2", "trunk", "trunk", native=99, allowed="10,99"),
         switchport("Et0/3", "trunk", "trunk", native=99, allowed="10,99"),

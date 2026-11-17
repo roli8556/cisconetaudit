@@ -16,8 +16,9 @@ import ipaddress
 import re
 from collections import defaultdict
 
-from ..models import Finding, Fix, FixInput, FixTarget
+from ..models import Finding, Fix, FixInput, FixQuestion, FixTarget
 from ..parsers.ios import format_vlan_list, parse_vlan_list
+from .l2security import DAI_VALIDATION
 
 # VLANs 1002-1005 are reserved for old FDDI/Token Ring; 1 is what we're moving away from.
 RESERVED_VLANS = {1, 1002, 1003, 1004, 1005}
@@ -301,24 +302,160 @@ def _build_syslog_server(fix_input: FixInput, value: str) -> list[Fix]:
     return [_fix([t], [f"logging host {value}", "logging trap informational"]) for t in fix_input.targets]
 
 
+# ---------------------------------------------------------------- port security
+
+
+def _validate_choice(options: list[str]):
+    """Returns a validator for "one of these words" - a function that makes a function."""
+    def validator(fix_input: FixInput, value: str) -> str | None:
+        return None if value.lower() in options else f"type one of: {', '.join(options)}"
+    return validator
+
+
+def _build_port_security(fix_input: FixInput, answers: dict[str, str]) -> list[Fix]:
+    """Settings first, "switchport port-security" (= on) LAST: switched on with the default
+    maximum of 1 MAC, a port with a PC + phone would be shut down before maximum is raised."""
+    settings = [f"switchport port-security maximum {answers['maximum']}",
+                f"switchport port-security violation {answers['value'].lower()}"]
+    if answers["sticky"] == "y":
+        settings.append("switchport port-security mac-address sticky")
+    if int(answers["aging"]) > 0:
+        settings += [f"switchport port-security aging time {answers['aging']}",
+                     "switchport port-security aging type inactivity"]
+    fixes = []
+    for host_ip, targets in _per_device(fix_input.targets).items():
+        commands = []
+        for port in targets:
+            # port security needs a static access port - "switchport mode access" makes sure
+            commands += [f"interface {port.interface}", "switchport mode access", *settings, "switchport port-security"]
+        fixes.append(_fix(targets, commands))
+    return fixes
+
+
+# ---------------------------------------------------------------- DHCP snooping / DAI
+#
+# Targets (see scans/l2security.py): role=device (params mgmt_vlan, + snooped/unbound for DAI),
+# role=trusted (uplinks to trust), role=edge (edge ports to rate-limit)
+
+
+def _device_params(fix_input: FixInput) -> dict[str, str]:
+    return next(t.params for t in fix_input.targets if t.params["role"] == "device")
+
+
+def _validate_snoop_vlans(fix_input: FixInput, value: str) -> str | None:
+    error = _validate_allowed_vlans(fix_input, value)
+    if error or value.strip().lower() in ("all", "none"):
+        return error or "list the VLANs explicitly, e.g. 10,20"
+    return None
+
+
+def _warn_mgmt_vlan(fix_input: FixInput, value: str) -> str | None:
+    mgmt = _device_params(fix_input).get("mgmt_vlan")
+    if mgmt and int(mgmt) in parse_vlan_list(value):
+        return (f"VLAN {mgmt} is the management VLAN netaudit connects through - hosts with static IPs "
+                "there (like the management PC) can lose connectivity")
+    return None
+
+
+def _role_commands(fix_input: FixInput, role: str, *commands: str) -> list[str]:
+    """interface X + commands, for every target port with this role."""
+    return [cmd for t in fix_input.targets if t.params["role"] == role
+            for cmd in (f"interface {t.interface}", *commands)]
+
+
+def _build_dhcp_snooping(fix_input: FixInput, answers: dict[str, str]) -> list[Fix]:
+    vlans = format_vlan_list(parse_vlan_list(answers["value"]))
+    commands = [f"ip dhcp snooping vlan {vlans}"]
+    if answers.get("no_option82") == "y":
+        commands.append("no ip dhcp snooping information option")
+    commands += _role_commands(fix_input, "trusted", "ip dhcp snooping trust")
+    commands += _role_commands(fix_input, "edge", f"ip dhcp snooping limit rate {answers['rate']}")
+    commands.append("ip dhcp snooping")  # LAST - see the finding's description
+    return [_fix(fix_input.targets, commands)]
+
+
+def _validate_dai_vlans(fix_input: FixInput, value: str) -> str | None:
+    error = _validate_snoop_vlans(fix_input, value)
+    if error:
+        return error
+    not_snooped = parse_vlan_list(value) - parse_vlan_list(_device_params(fix_input)["snooped"])
+    if not_snooped:
+        return (f"VLAN(s) {format_vlan_list(not_snooped)} aren't DHCP-snooped - DAI would have no "
+                "bindings there and drop ALL ARP")
+    return None
+
+
+def _warn_dai_vlans(fix_input: FixInput, value: str) -> str | None:
+    chosen = parse_vlan_list(value)
+    unbound = [item.split(":") for item in _device_params(fix_input)["unbound"].split(",") if item]
+    affected = [port for vlan, port in unbound if int(vlan) in chosen]
+    if affected:
+        return f"active port(s) {', '.join(affected)} have no DHCP binding - they would lose ARP"
+    return _warn_mgmt_vlan(fix_input, value)
+
+
+def _build_dai(fix_input: FixInput, answers: dict[str, str]) -> list[Fix]:
+    vlans = format_vlan_list(parse_vlan_list(answers["value"]))
+    commands = _role_commands(fix_input, "trusted", "ip arp inspection trust")
+    commands += _role_commands(fix_input, "edge", f"ip arp inspection limit rate {answers['rate']}")
+    commands += [f"ip arp inspection validate {' '.join(DAI_VALIDATION)}", f"ip arp inspection vlan {vlans}"]
+    return [_fix(fix_input.targets, commands)]
+
+
+# ---------------------------------------------------------------- errdisable recovery
+
+
+def _validate_recovery_interval(fix_input: FixInput, value: str) -> str | None:
+    if not value.isdigit() or not 30 <= int(value) <= 86400:
+        return "enter a number of seconds between 30 and 86400"
+    return None
+
+
+def _build_errdisable_recovery(fix_input: FixInput, value: str) -> list[Fix]:
+    target = fix_input.targets[0]
+    causes = [f"errdisable recovery cause {c}" for c in target.params["missing"].split(",") if c]
+    return [_fix([target], [*causes, f"errdisable recovery interval {value}"])]
+
+
 # ---------------------------------------------------------------- dispatch
 
+
+def _single(builder):
+    """Adapt a builder that takes one value to the answers-dict form used by dispatch."""
+    return lambda fix_input, answers: builder(fix_input, answers["value"])
+
 _HANDLERS = {
-    "native-vlan": (_validate_native_vlan, _build_native_vlan),
-    "allowed-vlans": (_validate_allowed_vlans, _build_allowed_vlans),
-    "ospf-timers": (_validate_ospf_timers, _build_ospf_timers),
-    "channel-group": (_validate_channel_group, _build_channel_group),
-    "parking-vlan": (_validate_parking_vlan, _build_parking_vlan),
-    "hostname": (_validate_hostname, _build_hostname),
-    "domain-name": (_validate_domain_name, _build_domain_name),
-    "ntp-server": (_validate_server, _build_ntp_server),
-    "syslog-server": (_validate_server, _build_syslog_server),
+    "native-vlan": (_validate_native_vlan, _single(_build_native_vlan)),
+    "allowed-vlans": (_validate_allowed_vlans, _single(_build_allowed_vlans)),
+    "ospf-timers": (_validate_ospf_timers, _single(_build_ospf_timers)),
+    "channel-group": (_validate_channel_group, _single(_build_channel_group)),
+    "parking-vlan": (_validate_parking_vlan, _single(_build_parking_vlan)),
+    "hostname": (_validate_hostname, _single(_build_hostname)),
+    "domain-name": (_validate_domain_name, _single(_build_domain_name)),
+    "ntp-server": (_validate_server, _single(_build_ntp_server)),
+    "syslog-server": (_validate_server, _single(_build_syslog_server)),
+    "port-security": (_validate_choice(["shutdown", "restrict", "protect"]), _build_port_security),
+    "dhcp-snooping": (_validate_snoop_vlans, _build_dhcp_snooping),
+    "dai": (_validate_dai_vlans, _build_dai),
+    "errdisable-recovery": (_validate_recovery_interval, _single(_build_errdisable_recovery)),
 }
 
 
 def validate(fix_input: FixInput, value: str) -> str | None:
+    """Check the answer to the MAIN question."""
     validator, _ = _HANDLERS[fix_input.kind]
     return validator(fix_input, value.strip())
+
+
+def validate_followup(question: FixQuestion, value: str) -> str | None:
+    """Check the answer to a follow-up question - generic, from the question's own rules."""
+    value = value.strip().lower()
+    if question.choices and value not in question.choices:
+        return f"type one of: {', '.join(question.choices)}"
+    if question.min_value is not None:
+        if not value.isdigit() or not question.min_value <= int(value) <= question.max_value:
+            return f"enter a number between {question.min_value} and {question.max_value}"
+    return None
 
 
 # Valid values that may still be a bad idea - the user is warned and asked to confirm.
@@ -326,6 +463,8 @@ _WARNINGS = {
     "native-vlan": _warn_native_vlan,
     "allowed-vlans": _warn_allowed_vlans,
     "parking-vlan": _warn_parking_vlan,
+    "dhcp-snooping": _warn_mgmt_vlan,
+    "dai": _warn_dai_vlans,
 }
 
 
@@ -334,14 +473,22 @@ def warning(fix_input: FixInput, value: str) -> str | None:
     return check(fix_input, value.strip()) if check else None
 
 
-def resolve(finding: Finding, value: str) -> Finding:
-    """Return a copy of the finding with its fixes built from the user's value.
+def resolve(finding: Finding, answers: str | dict[str, str]) -> Finding:
+    """Return a copy of the finding with its fixes built from the user's answers.
+
+    answers: just the main value (a str), or {"value": ..., "<followup key>": ...}. Follow-ups
+    that weren't answered get their default.
 
     dataclasses.replace() makes a copy with some fields changed - the original finding (which
     is also in the saved report) stays untouched.
     """
-    assert finding.fix_input is not None
-    _, builder = _HANDLERS[finding.fix_input.kind]
-    fixes = builder(finding.fix_input, value.strip())
-    return dataclasses.replace(finding, fixes=fixes, fix_input=None,
-                               fix_description=f"{finding.fix_description} Chosen value: {value.strip()}")
+    fix_input = finding.fix_input
+    assert fix_input is not None
+    if isinstance(answers, str):  # isinstance() = runtime type check, like dynamic_cast in C++
+        answers = {"value": answers}
+    answers = {"value": answers["value"].strip(),
+               **{q.key: answers.get(q.key, q.default).strip().lower() for q in fix_input.followups}}
+    _, builder = _HANDLERS[fix_input.kind]
+    chosen = ", ".join(answers.values())
+    return dataclasses.replace(finding, fixes=builder(fix_input, answers), fix_input=None,
+                               fix_description=f"{finding.fix_description} Chosen: {chosen}")

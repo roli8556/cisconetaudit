@@ -20,6 +20,7 @@ from ..models import (
     CdpNeighbor,
     DeviceSnapshot,
     InterfaceState,
+    L2SecurityConfig,
     ManagementConfig,
     NtpStatus,
     OspfInterface,
@@ -137,6 +138,7 @@ def parse_show_interfaces(output: str) -> dict[str, InterfaceState]:
             mtu=int(row["mtu"]) if row["mtu"] else None,
             duplex=_normalize_duplex(row["duplex"]),
             speed=_normalize_speed(row["speed"]),
+            ip_address=row["ip_address"],
         )
     return interfaces
 
@@ -218,6 +220,7 @@ def parse_cdp_neighbors(output: str) -> list[CdpNeighbor]:
             remote_interface=normalize_interface(row["neighbor_interface"]),
             mgmt_ip=row["mgmt_address"],
             platform=row["platform"],
+            capabilities=row["capabilities"],
         )
         for row in _ntc("show cdp neighbors detail", output)
     ]
@@ -331,6 +334,39 @@ def parse_management_config(config: str) -> ManagementConfig:
     return result
 
 
+def parse_l2security_config(config: str) -> L2SecurityConfig:
+    result = L2SecurityConfig()
+    for line in _global_lines(config):
+        if re.fullmatch(r"spanning-tree portfast (edge )?default", line):
+            result.portfast_default = True
+        elif re.fullmatch(r"spanning-tree portfast (edge )?bpduguard default", line):
+            result.bpduguard_default = True
+        elif line == "ip dhcp snooping":
+            result.dhcp_snooping = True
+        elif match := re.fullmatch(r"ip dhcp snooping vlan (\S+)", line):
+            result.dhcp_snooping_vlans = match.group(1)
+        elif line == "no ip dhcp snooping information option":
+            result.option82 = False
+        elif match := re.fullmatch(r"ip arp inspection vlan (\S+)", line):
+            result.dai_vlans = match.group(1)
+        elif match := re.fullmatch(r"ip arp inspection validate (.+)", line):
+            result.dai_validate = match.group(1).split()
+        elif match := re.fullmatch(r"errdisable recovery cause (\S+)", line):
+            result.errdisable_causes.append(match.group(1))
+        elif match := re.fullmatch(r"errdisable recovery interval (\d+)", line):
+            result.errdisable_interval = int(match.group(1))
+    return result
+
+
+# "aa:bb:cc:dd:ee:ff  10.10.10.5  86000  dhcp-snooping  10  Ethernet1/0" - last column = port
+_BINDING = re.compile(r"^[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}\s+\S+\s+\d+\s+\S+\s+\d+\s+(\S+)", re.M)
+
+
+def parse_dhcp_bindings(output: str) -> set[str]:
+    """Ports that have at least one DHCP snooping binding."""
+    return {normalize_interface(m.group(1)) for m in _BINDING.finditer(output)}
+
+
 def parse_ntp_status(output: str) -> NtpStatus | None:
     """"Clock is synchronized, stratum 3, reference is 10.0.0.1" ... None if NTP isn't running
     ("%NTP is not enabled.")."""
@@ -374,6 +410,22 @@ def apply_config(interfaces: dict[str, InterfaceState], config: str) -> None:
                 intf.configured_duplex = match.group(1)
             elif re.match(r"(ipv6 ospf \d+ area|ospfv3 \d+ (ipv4|ipv6) area)", line):
                 intf.ospfv3 = True
+            elif re.fullmatch(r"spanning-tree portfast( edge)?", line):
+                intf.portfast = "enable"
+            elif line == "spanning-tree portfast disable":
+                intf.portfast = "disable"
+            elif match := re.fullmatch(r"spanning-tree bpduguard (enable|disable)", line):
+                intf.bpduguard = match.group(1)
+            elif line == "switchport port-security":  # the line that turns it ON
+                intf.port_security = True
+            elif line == "ip dhcp snooping trust":
+                intf.dhcp_trust = True
+            elif match := re.fullmatch(r"ip dhcp snooping limit rate (\d+)", line):
+                intf.dhcp_rate = int(match.group(1))
+            elif line == "ip arp inspection trust":
+                intf.dai_trust = True
+            elif match := re.fullmatch(r"ip arp inspection limit rate (\d+).*", line):
+                intf.dai_rate = int(match.group(1))
 
 
 def build_snapshot(host_ip: str, hostname: str, outputs: dict[str, str]) -> DeviceSnapshot:
@@ -394,6 +446,8 @@ def build_snapshot(host_ip: str, hostname: str, outputs: dict[str, str]) -> Devi
         ospf_neighbors=parse_ospf_neighbors(outputs.get("show ip ospf neighbor", "")),
         vlans=parse_vlans(outputs.get("show vlan brief", "")),
         management=parse_management_config(config),
+        l2security=parse_l2security_config(config),
+        dhcp_binding_ports=parse_dhcp_bindings(outputs.get("show ip dhcp snooping binding", "")),
         ntp=parse_ntp_status(outputs.get("show ntp status", "")),
         rsa_key_name=parse_rsa_key_name(outputs.get("show crypto key mypubkey rsa", "")),
         ip_addresses=interface_ips(outputs.get("show interfaces", "")) | {host_ip},

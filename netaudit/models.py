@@ -56,6 +56,15 @@ class InterfaceState:
     configured_speed: str = ""  # "" = not configured (= auto)
     configured_duplex: str = ""
     ospfv3: bool = False  # "ipv6 ospf ... area" / "ospfv3 ... area" on this interface
+    ip_address: str = ""  # from "show interfaces" (SVIs and routed ports)
+    # layer-2 security, from the interface config
+    portfast: str = ""  # "enable", "disable" or "" (not configured -> global default applies)
+    bpduguard: str = ""  # same
+    port_security: bool = False  # "switchport port-security"
+    dhcp_trust: bool = False  # "ip dhcp snooping trust"
+    dhcp_rate: int | None = None  # "ip dhcp snooping limit rate N"
+    dai_trust: bool = False  # "ip arp inspection trust"
+    dai_rate: int | None = None  # "ip arp inspection limit rate N"
 
     @property
     def is_up(self) -> bool:
@@ -91,6 +100,12 @@ class CdpNeighbor:
     remote_interface: str
     mgmt_ip: str = ""
     platform: str = ""
+    capabilities: str = ""  # "Router Switch IGMP", "Host Phone"...
+
+    @property
+    def is_network_device(self) -> bool:
+        """A switch or router (an uplink) - as opposed to a phone or other end device."""
+        return any(cap in self.capabilities.split() for cap in ("Router", "Switch", "Trans-Bridge"))
 
 
 @dataclass
@@ -112,6 +127,21 @@ class ManagementConfig:
     logging_hosts: list[str] = field(default_factory=list)
     lines_without_logging_sync: list[str] = field(default_factory=list)  # e.g. ["line vty 0 4"]
     ssh_keypair_pinned: bool = False  # "ip ssh rsa keypair-name ..." is configured
+
+
+@dataclass
+class L2SecurityConfig:
+    """Device-wide layer-2 security settings from the running-config."""
+
+    portfast_default: bool = False  # "spanning-tree portfast [edge] default"
+    bpduguard_default: bool = False  # "spanning-tree portfast [edge] bpduguard default"
+    dhcp_snooping: bool = False  # global "ip dhcp snooping"
+    dhcp_snooping_vlans: str = ""  # "10,20"
+    option82: bool = True  # IOS inserts option 82 unless "no ip dhcp snooping information option"
+    dai_vlans: str = ""  # "ip arp inspection vlan 10,20"
+    dai_validate: list[str] = field(default_factory=list)  # ["src-mac", "dst-mac", "ip"]
+    errdisable_causes: list[str] = field(default_factory=list)  # "errdisable recovery cause X"
+    errdisable_interval: int | None = None
 
 
 @dataclass
@@ -137,6 +167,8 @@ class DeviceSnapshot:
     ospf_neighbors: list[OspfNeighbor] = field(default_factory=list)
     vlans: dict[int, str] = field(default_factory=dict)  # VLAN id -> name, from "show vlan brief"
     management: ManagementConfig = field(default_factory=ManagementConfig)
+    l2security: L2SecurityConfig = field(default_factory=L2SecurityConfig)
+    dhcp_binding_ports: set[str] = field(default_factory=set)  # ports with a DHCP snooping binding
     ntp: NtpStatus | None = None  # None = NTP not running at all
     rsa_key_name: str = ""  # the SSH host key pair, from "show crypto key mypubkey rsa"
     ip_addresses: set[str] = field(default_factory=set)  # all interface IPs (to follow NTP chains)
@@ -174,15 +206,32 @@ class FixTarget:
 
 
 @dataclass
-class FixInput:
-    """A fix that needs a value from the user before its commands can be built
-    (e.g. which native VLAN to use). The scan only describes the question; the menu asks it,
-    and scans/fix_inputs.py turns the answer into Fix objects."""
+class FixQuestion:
+    """A follow-up question of a FixInput (e.g. port security: max MACs, aging...).
+    Checked generically: choices (one of a list) or a number range."""
 
-    kind: str  # "native-vlan", "allowed-vlans", "ospf-timers", "channel-group"
+    key: str  # name of the answer, e.g. "aging"
+    question: str
+    default: str = ""
+    choices: list[str] = field(default_factory=list)  # allowed answers, if limited
+    min_value: int | None = None  # set both for a number answer
+    max_value: int | None = None
+
+
+@dataclass
+class FixInput:
+    """A fix that needs values from the user before its commands can be built
+    (e.g. which native VLAN to use). The scan only describes the questions; the menu asks them,
+    and scans/fix_inputs.py turns the answers into Fix objects.
+
+    The main question's answer is stored under the key "value"; followups add more answers.
+    """
+
+    kind: str  # "native-vlan", "allowed-vlans", "ospf-timers", "channel-group", ...
     question: str
     default: str = ""  # "" = no default, the user must type a value
     targets: list[FixTarget] = field(default_factory=list)
+    followups: list[FixQuestion] = field(default_factory=list)
 
 
 @dataclass
