@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Project data: contains device configs, inventories and logs from real/lab networks.
+# Never commit these.
+projects/
+*.log
+
+# Secrets
+.env
+*.secret
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
