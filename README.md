@@ -14,9 +14,16 @@ traffic to find congestion and suggest improvements to STP, HSRP and ACLs.
 - [x] Projects: create and load a project folder per network
 - [x] Inventory of devices with validation, encrypted with a per-project password
 - [x] Collect running configs over SSH (saved encrypted to `configs/<hostname>_<ip>_<timestamp>.enc`)
+- [x] Baseline scan: finds links with CDP and compares both ends (MTU, speed/duplex, trunk/access,
+      native + allowed VLANs, OSPF area/timers/passive/version, EtherChannel group/mode), and
+      compares config with live state (OSPF neighbors, port-channel bundling, trunking)
+      plus DTP (negotiated links, edge ports) and unhardened unused ports (parking VLAN)
+      and management settings: hostname, same domain name everywhere, logging synchronous,
+      NTP configured + synchronized + same time source, syslog server
 - [ ] Static security audit with rules mapped to CIS / Cisco hardening guides
 - [ ] Reports with findings and suggested config changes
-- [ ] Apply changes: one at a time with confirmation, or automatically, with rollback
+- [x] Apply fixes: show commands only, step by step with confirmation, or all at once - with
+      automatic rollback (`configure terminal revert timer`) and a re-scan to verify
 - [ ] Traffic monitoring over SNMP and live analysis
 
 ## Usage
@@ -33,6 +40,28 @@ python main.py --load "C:\path\to\my-project"   # load a project directly
    (IPv4 or IPv6; no spaces in any field; enable password only if the account doesn't log in at
    privilege 15). Delete the plaintext file afterwards - the tool offers to do it.
 
+### Applying fixes needs the IOS archive feature
+
+Fixes are applied with `configure terminal revert timer 5`: if netaudit can't log in again
+afterwards to run `configure confirm`, the device rolls the change back by itself. That requires
+the archive feature on each device:
+
+```
+archive
+ path flash:netaudit-
+```
+
+(On IOL, `flash:` may not exist; use `unix:` instead.) Without it, netaudit refuses to change the device.
+
+## Tests
+
+```powershell
+python -m pytest
+```
+
+`tests/sample_outputs.py` contains realistic IOS output for two switches with a deliberate fault
+for every baseline check.
+
 ## Project layout
 
 A project is a self-contained folder that can live anywhere, e.g. one folder per network
@@ -42,9 +71,9 @@ inside `Documents\netaudit-projects\`. Keep project folders outside this reposit
 <project folder>/
     config.json     project settings
     hosts.enc       devices + SSH credentials, encrypted with the project password
-    project.log     log of everything the tool has done
+    project.log.enc log of everything the tool has done (encrypted line by line)
     known_hosts     accepted SSH host keys
-    scans/          saved scan results
+    scans/          scan reports (encrypted)
     configs/        saved device configurations (encrypted)
 ```
 

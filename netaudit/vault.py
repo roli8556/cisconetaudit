@@ -102,6 +102,16 @@ class Vault:
         except InvalidToken:
             raise WrongPasswordError("Wrong project password (or the file has been modified)") from None
 
+    def encrypt_line(self, text: str) -> str:
+        """Encrypt one short text (a log line) into a single-line token (base64, no newlines)."""
+        return self._fernet.encrypt(text.encode("utf-8")).decode("ascii")
+
+    def decrypt_line(self, token: str) -> str:
+        try:
+            return self._fernet.decrypt(token.strip().encode("ascii")).decode("utf-8")
+        except (InvalidToken, ValueError):
+            raise VaultError("line can't be decrypted with this project's key") from None
+
     def write(self, path: Path, plaintext: str) -> None:
         """Encrypt plaintext and save it to path.
 

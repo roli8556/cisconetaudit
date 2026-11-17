@@ -4,9 +4,9 @@ Project: a folder holding everything for one network you audit.
     <any folder>/<name>/
         config.json     settings for this project (collection method etc.) - not secret
         hosts.enc       the devices to audit, with credentials - encrypted with the project password
-        project.log     everything the tool has done in this project
+        project.log.enc everything the tool has done in this project - encrypted line by line
         known_hosts     accepted SSH host keys (public keys - not secret)
-        scans/          saved scan results
+        scans/          saved scan reports (*.enc) - encrypted JSON
         configs/        saved device configurations (*.enc) - encrypted with the project password
 """
 
@@ -21,19 +21,57 @@ from pathlib import Path
 
 from .inventory import Host, InventoryError, format_hosts, parse_hosts
 from .models import RunningConfig
-from .vault import Vault
+from .scans.report import ScanReport
+from .vault import Vault, VaultError
 
 CONFIG_FILE = "config.json"
 HOSTS_FILE = "hosts.enc"
-LOG_FILE = "project.log"
+LOG_FILE = "project.log.enc"  # one encrypted token per line, see EncryptedFileHandler
 KNOWN_HOSTS_FILE = "known_hosts"  # created on first accepted SSH host key
 SUBFOLDERS = ("scans", "configs")
 VALID_METHODS = ("ssh", "snmp")
 MIN_PASSWORD_LENGTH = 12
 
 
+def _unique_path(path: Path) -> Path:
+    """path, or path with _2, _3... added if it already exists - two saves in the same second
+    must never overwrite each other."""
+    counter = 2
+    candidate = path
+    while candidate.exists():
+        candidate = path.with_stem(f"{path.stem}_{counter}")
+        counter += 1
+    return candidate
+
+
 class ProjectError(Exception):
     """Raised when a project can't be created or loaded."""
+
+
+class EncryptedFileHandler(logging.Handler):
+    """A logging handler that encrypts every log line separately before appending it.
+
+    Logs can't be one big encrypted blob: they're appended to constantly, and re-encrypting the
+    whole file per line would be slow and risky. One token per line means each line can be
+    written (and later decrypted) on its own. What leaks: the number of lines and their rough
+    length - not their content.
+
+    Subclassing logging.Handler and overriding emit() is the standard way to send log records
+    somewhere new - like overriding a virtual method in C++.
+    """
+
+    def __init__(self, path: Path, vault: Vault) -> None:
+        super().__init__()  # call the base class constructor
+        self.path = path
+        self.vault = vault
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            token = self.vault.encrypt_line(self.format(record))
+            with self.path.open("a", encoding="ascii") as file:  # "a" = append
+                file.write(token + "\n")
+        except Exception:
+            self.handleError(record)  # logging must never crash the program
 
 
 @dataclass
@@ -163,7 +201,7 @@ class Project:
         # IPv6 has ":" too, and the hostname comes from the device - so whitelist the characters
         safe_ip = config.host_ip.replace(":", "-")
         safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", config.hostname) or "unknown"
-        path = self.configs_dir / f"{safe_name}_{safe_ip}_{stamp}.enc"
+        path = _unique_path(self.configs_dir / f"{safe_name}_{safe_ip}_{stamp}.enc")
         self._vault.write(path, config.text)
         self.log.info("Running-config saved: %s -> %s", config.host_ip, path.name)
         return path
@@ -198,14 +236,48 @@ class Project:
         missing += [d + "/" for d in SUBFOLDERS if not (path / d).is_dir()]
         return missing
 
+    def read_log(self) -> list[str]:
+        """Decrypt project.log.enc line by line."""
+        path = self.path / LOG_FILE
+        if not path.is_file():
+            return []
+        lines = []
+        for token in path.read_text(encoding="ascii").splitlines():
+            try:
+                lines.append(self._vault.decrypt_line(token))
+            except VaultError:
+                lines.append("[unreadable line - damaged, or written with another key]")
+        return lines
+
+    # ---------- scan reports ----------
+
+    def save_scan(self, report: ScanReport) -> Path:
+        """Store a scan report as encrypted JSON: scans/<type>_<timestamp>.enc"""
+        stamp = report.started.strftime("%Y-%m-%dT%H-%M-%S")
+        path = _unique_path(self.path / "scans" / f"{report.scan_type}_{stamp}.enc")
+        self._vault.write(path, json.dumps(report.to_dict(), indent=2))
+        self.log.info("Scan report saved: %s (%d findings)", path.name, len(report.findings))
+        return path
+
+    def list_scans(self) -> list[Path]:
+        return sorted((self.path / "scans").glob("*.enc"))
+
+    def read_scan(self, path: Path) -> ScanReport:
+        return ScanReport.from_dict(json.loads(self._vault.read(path)))
+
+    # ---------- logging ----------
+
     def _setup_logger(self) -> logging.Logger:
-        """Each project gets its own logger writing to its own project.log."""
+        """Each project gets its own logger writing to its own encrypted log file."""
         logger = logging.getLogger(f"netaudit.{self.config.name}")
         logger.setLevel(logging.INFO)
-        logger.handlers.clear()  # avoid duplicate lines if the project is reloaded
-        handler = logging.FileHandler(self.path / LOG_FILE, encoding="utf-8")
+        for old in logger.handlers:  # if the project is reloaded, close the old file handler
+            old.close()
+        logger.handlers.clear()
+        handler = EncryptedFileHandler(self.path / LOG_FILE, self._vault)
         handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s"))
         logger.addHandler(handler)
+        logger.propagate = False  # don't also pass records to the root logger (e.g. the console)
         return logger
 
     def __repr__(self) -> str:

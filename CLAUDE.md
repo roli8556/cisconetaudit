@@ -36,10 +36,31 @@ in a real network, not just a lab toy.
 - Host keys: per-project known_hosts, TOFU. collectors/hostkeys.py pre-checks the key (clear error),
   then netmiko connects with ssh_strict=True + alt_key_file as a second check. The collector asks
   via an injected confirm_new_key callback - collectors never call input()/print().
+- Scans: collectors/ssh.py fetch_snapshot() -> parsers/ios.py build_snapshot() -> models.DeviceSnapshot
+  -> scans/baseline.py (pure, tested with tests/sample_outputs.py) -> Findings with optional Fixes.
+  ntc-templates are used where reliable; switchport (wrapped VLAN lists) and full
+  "show ip ospf interface" are parsed by hand. Interface names always normalized to full form.
+- Fixes: grouped per device, applied with "configure terminal revert timer" + reconnect +
+  "configure confirm"; IOS errors ("^% ") -> "configure revert now". Then re-scan as post-check.
+  Requires IOS archive config on devices.
+- Fixes needing a user value (native VLAN, allowed VLANs, OSPF timers, port-channel number) are
+  Finding.fix_input (FixInput + FixTargets, pure data); scans/fix_inputs.py validates/warns/builds
+  commands; main.ask_fix_value asks in both step-by-step and fix-all. remediation.reconcile()
+  merges fixes that would undo each other (mode fix + port-channel renumber on the same port).
+- Fix.phase: all devices get phase-1 commands before any phase-2 command; a failure skips later
+  phases. Used by the DTP fix (1: explicit mode, 2: nonegotiate) so links never break mid-change.
+- Unused ports fix creates the parking VLAN explicitly if missing: IOS's auto-create prints
+  "% Access VLAN does not exist", which the "^% " error pattern would treat as a failure.
+- scans/management.py: device checks (hostname, logging synchronous, NTP, syslog) and network checks
+  across all devices (same domain name, same NTP root source - chains followed via interface IPs).
+- Hostname/domain fixes first pin the SSH key ("ip ssh rsa keypair-name <current>"): the default key
+  is named hostname.domain, so renaming could kill SSH. netmiko copes with the prompt change
+  (config reads wait for base prompt OR "#").
+- Log is encrypted per line (EncryptedFileHandler, project.log.enc); scan reports are encrypted JSON.
 - Saved configs are vault-encrypted (configs/*.enc), same key as hosts.enc (Vault.read/write).
 
 ## Planned stack
-Python 3.12+, cryptography, netmiko (SSH), ciscoconfparse2 (config parsing), later nornir, pysnmp, pytest.
+Python 3.12+, cryptography, netmiko (+ ntc-templates), pytest (SSH), ciscoconfparse2 (config parsing), later nornir, pysnmp, pytest.
 
 ## Lab environment
 - Windows laptop with Hyper-V, Cisco Modeling Labs (CML Free, 5-node limit) as a VM.

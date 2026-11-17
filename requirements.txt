@@ -1,2 +1,3 @@
 cryptography>=44.0
 netmiko>=4.4
+pytest>=8.0
