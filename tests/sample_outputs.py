@@ -12,9 +12,9 @@ Cabling (all SW1 <-> SW2, same interface on both ends, plus SW1 Et2/1 -> R3):
     Et1/1  routed, OSPF, SW2 passive; SW1 hardcoded 100/full, SW2 auto -> half duplex
     Et1/2  SW1 access port, SW2 trunk
     Et1/3  SW1 only: OSPF towards hosts, no neighbor             -> should be passive
-    Et2/0  OSPFv2 on SW1, OSPFv3 on SW2
+    Et2/0  OSPFv2 on SW1, OSPFv3 on SW2; ARP type ARPA vs SNAP
     Et2/1  SW1 -> R3 (not in the project), OSPF stuck in EXSTART
-    Et2/2  trunk, both ends still on native VLAN 1
+    Et2/2  trunk, both ends still on native VLAN 1; media copper vs LX SFP
     Et3/2  mode negotiated with DTP: SW1 dynamic desirable, SW2 dynamic auto -> trunk
 Single ports:
     SW1 Et3/0  down, IOS default (dynamic auto, VLAN 1)          -> unused, not hardened
@@ -33,7 +33,8 @@ SW1_IP, SW2_IP = "192.168.100.11", "192.168.100.12"
 
 
 def show_interface(name: str, status: str = "up", mtu: int = 1500, duplex: str = "Full-duplex",
-                   speed: str = "100Mb/s", ip: str | None = None) -> str:
+                   speed: str = "100Mb/s", ip: str | None = None, media: str = "unknown",
+                   arp: str = "ARPA") -> str:
     protocol = "up" if status == "up" else "down"
     ip_line = f"  Internet address is {ip}\n" if ip else ""
     return f"""{name} is {status}, line protocol is {protocol} (connected)
@@ -42,9 +43,9 @@ def show_interface(name: str, status: str = "up", mtu: int = 1500, duplex: str =
      reliability 255/255, txload 1/255, rxload 1/255
   Encapsulation ARPA, loopback not set
   Keepalive set (10 sec)
-  {duplex}, {speed}, media type is unknown
+  {duplex}, {speed}, media type is {media}
   input flow-control is off, output flow-control is unsupported
-  ARP type: ARPA, ARP Timeout 04:00:00
+  ARP type: {arp}, ARP Timeout 04:00:00
   Last input 00:00:01, output 00:00:00, output hang never
   Last clearing of "show interface" counters never
   Input queue: 0/2000/0/0 (size/max/drops/flushes); Total output drops: 0
@@ -62,7 +63,8 @@ def show_interface(name: str, status: str = "up", mtu: int = 1500, duplex: str =
 
 
 def switchport(name: str, admin: str = "", oper: str = "", native: int = 1, allowed: str = "ALL",
-               enabled: bool = True, access: int = 1, nonegotiate: bool = False, encap: str = "dot1q") -> str:
+               enabled: bool = True, access: int = 1, nonegotiate: bool = False, encap: str = "dot1q",
+               native_tagged: bool = False) -> str:
     if not enabled:
         return f"Name: {name}\nSwitchport: Disabled\n\n"
     # IOS: trunk and dynamic ports negotiate (DTP) unless "switchport nonegotiate"; access ports don't
@@ -75,6 +77,7 @@ Administrative Trunking Encapsulation: {encap}
 Negotiation of Trunking: {dtp}
 Access Mode VLAN: {access} (VLAN{access:04d})
 Trunking Native Mode VLAN: {native} (VLAN{native:04d})
+Administrative Native VLAN tagging: {"enabled" if native_tagged else "disabled"}
 Voice VLAN: none
 Trunking VLANs Enabled: {allowed}
 Pruning VLANs Enabled: 2-1001
@@ -288,7 +291,7 @@ end
         show_interface("Ethernet1/3", ip="10.1.0.1/24"),
         show_interface("Ethernet2/0", ip="10.0.30.1/30"),
         show_interface("Ethernet2/1", ip="10.0.13.1/30"),
-        show_interface("Ethernet2/2"),
+        show_interface("Ethernet2/2", media="10/100/1000BaseTX"),
         show_interface("Ethernet3/0", status="down", duplex="Auto-duplex", speed="Auto-speed"),
         show_interface("Ethernet3/1", status="administratively down", duplex="Auto-duplex", speed="Auto-speed"),
         show_interface("Ethernet3/2"),
@@ -413,8 +416,8 @@ end
         show_interface("Ethernet1/0", mtu=1400, ip="10.0.12.2/30"),
         show_interface("Ethernet1/1", duplex="Half-duplex", ip="10.0.21.2/30"),
         show_interface("Ethernet1/2"),
-        show_interface("Ethernet2/0"),
-        show_interface("Ethernet2/2"),
+        show_interface("Ethernet2/0", arp="SNAP"),
+        show_interface("Ethernet2/2", media="1000BaseLX SFP"),
         show_interface("Ethernet3/0", status="down", duplex="Auto-duplex", speed="Auto-speed"),
         show_interface("Ethernet3/2"),
         show_interface("Port-channel1", status="down"),

@@ -4,7 +4,8 @@ Nothing is changed and no traffic is generated - it only reads snapshots.
 
 1. Links are found with CDP: "SW1 Et0/1 sees SW2 on its Et0/1". Only links where BOTH ends are
    in the project can be compared.
-2. Link checks compare the two ends: MTU, speed/duplex, trunk/access mode, native VLAN,
+2. Link checks compare the two ends: MTU, speed/duplex, media type, ARP type (routed ports),
+   trunk/access mode, native VLAN,
    allowed VLANs, OSPF (area, timers, passive, version) and EtherChannel (group, mode).
 3. Device checks compare the configuration with the live state, e.g. OSPF is enabled on an
    interface but no neighbor reached FULL, or a port-channel member isn't bundled.
@@ -176,6 +177,40 @@ def check_speed(link: Link) -> Iterator[Finding]:
         + ("Two different fixed speeds - the link can't come up." if both_fixed
            else "Usually works (the auto side detects the speed), but best practice is the same setting on both ends."),
         "Set speed to auto on the hardcoded end(s).", fixes,
+    )
+
+
+def check_media_type(link: Link) -> Iterator[Finding]:
+    a, b = link.a.state, link.b.state
+    if not (a and b and a.media_type and b.media_type):
+        return
+    if "unknown" in (a.media_type, b.media_type) or a.media_type == b.media_type:
+        return  # virtual ports (IOL) and some platforms print "unknown" - nothing to compare
+    yield Finding(
+        "media-type-mismatch", "low", link.location,
+        f"Media type differs: {a.media_type} vs {b.media_type}. Fine with a media converter in "
+        "between, but worth checking: mismatched optics (e.g. SX vs LX, wrong wavelength) cause "
+        "errors or a flapping link.",
+        "No automatic fix: check the cabling and transceivers on both ends.",
+    )
+
+
+def check_arp_type(link: Link) -> Iterator[Finding]:
+    # ARP only matters on routed (L3) ports. For an L3 EtherChannel the IP - and the ARP
+    # setting - is on the port-channel, which is what l2_state/l2_name point to for members.
+    a, b = link.a.l2_state, link.b.l2_state
+    if not (a and b) or a.switchport or b.switchport:
+        return
+    if not (a.arp_type and b.arp_type) or a.arp_type == b.arp_type:
+        return
+    # ARPA is the Ethernet default - if one end has it, move the other end back to it
+    fixes = [e.fix(f"interface {e.l2_name}", "arp arpa") for e, s in ((link.a, a), (link.b, b))
+             if "arpa" in (a.arp_type, b.arp_type) and s.arp_type != "arpa"]
+    yield Finding(
+        "arp-type-mismatch", "medium", link.l2_location,
+        f"ARP encapsulation differs: {a.arp_type} vs {b.arp_type}. The ends may not understand each "
+        "other's ARP packets, so IP traffic over the link can fail even though the link is up.",
+        "Use the same ARP type on both ends (ARPA, the Ethernet default).", fixes,
     )
 
 
@@ -412,7 +447,7 @@ def check_dtp(link: Link) -> Iterator[Finding]:
 
 
 LINK_CHECKS = [
-    check_mtu, check_duplex, check_speed, check_switchport_mode,
+    check_mtu, check_duplex, check_speed, check_media_type, check_arp_type, check_switchport_mode,
     check_native_vlan, check_allowed_vlans, check_dtp, check_ospf, check_etherchannel_mode,
 ]
 
@@ -513,6 +548,47 @@ def check_native_vlan_1(device: DeviceSnapshot, links: list[Link]) -> Iterator[F
                 "No automatic fix: the other end isn't in this project - changing only this end would "
                 "cause a native VLAN mismatch. Set the same unused VLAN on both ends.",
             )
+
+
+def check_native_vlan_hopping(device: DeviceSnapshot, links: list[Link]) -> Iterator[Finding]:
+    """Double-tagging VLAN hopping: a host on an access port in VLAN N sends a frame with two
+    802.1Q tags, outer = N. If N is a trunk's untagged native VLAN, the switch strips the outer
+    tag and sends the frame out the trunk with only the inner tag left - and the next switch
+    delivers it into the victim VLAN. Safe if the native VLAN is unused by access ports, or if
+    the native VLAN is tagged too ("vlan dot1q tag native").
+
+    Native VLAN 1 is skipped: check_native_vlan / check_native_vlan_1 already report it.
+    """
+    globally_tagged = re.search(r"^vlan dot1q tag native\b", device.running_config, re.M) is not None
+    # Untagged trunks, grouped by native VLAN. Members are reported as their port-channel.
+    trunks: dict[int, set[str]] = defaultdict(set)
+    for intf in device.interfaces.values():
+        if intf.is_trunk and intf.native_vlan and intf.native_vlan != 1:
+            if not (intf.native_vlan_tagged or globally_tagged):
+                name = f"Port-channel{intf.channel_group}" if intf.channel_group else intf.name
+                trunks[intf.native_vlan].add(name)
+
+    for vlan, trunk_names in sorted(trunks.items()):
+        # Access ports in that VLAN that aren't shut down - each is a place an attacker can sit.
+        access_ports = sorted(
+            intf.name for intf in device.interfaces.values()
+            if intf.switchport and not intf.is_trunk and intf.access_vlan == vlan
+            and "static access" in (intf.admin_mode, intf.oper_mode)
+            and intf.status != "administratively down"
+        )
+        if not access_ports:
+            continue
+        trunk_list = ", ".join(short_interface(n) for n in sorted(trunk_names))
+        port_list = ", ".join(short_interface(n) for n in access_ports)
+        yield Finding(
+            "native-vlan-hopping", "medium", f"{device.hostname} VLAN {vlan}",
+            f"VLAN {vlan} is the untagged native VLAN of trunk(s) {trunk_list} AND the access VLAN of "
+            f"{port_list}. A host on those ports can hop into other VLANs with double-tagged frames "
+            "(CIS Cisco IOS benchmark, Cisco VLAN security guidance).",
+            "No automatic fix: use an unused VLAN as native on both ends of each trunk, or tag the "
+            "native VLAN with 'vlan dot1q tag native' (global - affects ALL trunks on the switch, and "
+            "the other end must tag too, or native-VLAN traffic on those links stops).",
+        )
 
 
 def check_ospf_neighbor_states(device: DeviceSnapshot, links: list[Link]) -> Iterator[Finding]:
@@ -654,7 +730,7 @@ def check_unused_ports(device: DeviceSnapshot, links: list[Link]) -> Iterator[Fi
 
 
 DEVICE_CHECKS = [
-    check_native_vlan_1, check_ospf_neighbor_states, check_ospf_without_neighbor,
+    check_native_vlan_1, check_native_vlan_hopping, check_ospf_neighbor_states, check_ospf_without_neighbor,
     check_config_vs_state, check_dtp_edge_ports, check_unused_ports,
 ]
 

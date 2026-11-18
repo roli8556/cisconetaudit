@@ -38,11 +38,16 @@ class InterfaceState:
     mtu: int | None = None
     duplex: str = ""  # "full", "half", "auto" (normalized)
     speed: str = ""  # "100mb/s", "1000mb/s", "auto" (normalized)
+    media_type: str = ""  # "10/100/1000basetx", "1000baselx sfp", "unknown" (lowercase)
+    arp_type: str = ""  # ARP encapsulation: "arpa" (Ethernet default), "snap", "probe"
     # from "show interfaces switchport" (only for switchports)
     switchport: bool = False
     admin_mode: str = ""  # "trunk", "static access", "dynamic auto", "dynamic desirable"
     oper_mode: str = ""  # "trunk", "static access", "down"...
     native_vlan: int | None = None
+    # "Administrative Native VLAN tagging": True = the native VLAN is sent tagged too (global
+    # "vlan dot1q tag native"), which blocks double-tagging VLAN hopping. None = not shown.
+    native_vlan_tagged: bool | None = None
     access_vlan: int | None = None
     allowed_vlans: str = ""  # as IOS prints it: "ALL", "1,10-20"
     dtp: bool = False  # "Negotiation of Trunking: On" - the port sends/answers DTP

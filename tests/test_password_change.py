@@ -8,7 +8,7 @@ import pytest
 from netaudit.inventory import parse_hosts
 from netaudit.models import RunningConfig
 from netaudit.project import Project
-from netaudit.scans.report import ScanReport
+from netaudit.scans.report import BaselineReport
 from netaudit.vault import WrongPasswordError
 
 OLD, NEW = "correct horse battery", "a brand new passphrase"
@@ -18,7 +18,7 @@ def make_project(tmp_path) -> Project:
     project = Project.create(tmp_path, "lab", OLD)
     project.add_hosts(parse_hosts("10.0.0.1 admin secret\n"))
     project.save_config(RunningConfig("10.0.0.1", "SW1", "hostname SW1\nend\n", datetime(2026, 11, 17, 9)))
-    project.save_scan(ScanReport("baseline", datetime(2026, 11, 17, 10)))
+    project.save_scan(BaselineReport("baseline", datetime(2026, 11, 17, 10)))
     return project
 
 
@@ -31,7 +31,7 @@ def test_change_password(tmp_path):
         Project.load(project.path, OLD)
     again = Project.load(project.path, NEW)
     assert again.hosts[0].password == "secret"
-    assert "hostname SW1" in again.read_config(again.list_configs()[0])
+    assert "hostname SW1" in again.read_config(again.list_configs_by_hostname()[0])
     assert again.read_scan(again.list_scans()[0]).scan_type == "baseline"
     log = again.read_log()
     assert any("Host added" in line for line in log)  # written BEFORE the change - re-encrypted
@@ -47,7 +47,7 @@ def test_project_keeps_working_after_change(tmp_path):
     project.save_config(RunningConfig("10.0.0.1", "SW1", "hostname SW1\nend\n"))
     again = Project.load(project.path, NEW)
     assert any("written with the new key" in line for line in again.read_log())
-    assert all(again.read_config(p) for p in again.list_configs())
+    assert all(again.read_config(p) for p in again.list_configs_by_hostname())
 
 
 def test_check_password(tmp_path):
@@ -77,7 +77,7 @@ def test_crash_while_swapping_rolls_back(tmp_path):
     """Phase 2 interrupted: hosts.enc already swapped to the new key, the config not yet."""
     project = make_project(tmp_path)
     hosts = project.path / "hosts.enc"
-    config = project.list_configs()[0]
+    config = project.list_configs_by_hostname()[0]
     # simulate: everything staged, then hosts.enc swapped, then the crash
     os.replace(hosts, hosts.with_name("hosts.enc.pwchange-old"))
     hosts.write_text("re-encrypted with the new key")

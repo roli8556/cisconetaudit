@@ -14,10 +14,12 @@ traffic to find congestion and suggest improvements to STP, HSRP and ACLs.
 - [x] Projects: create and load a project folder per network
 - [x] Inventory of devices with validation, encrypted with a per-project password
 - [x] Collect running configs over SSH (saved encrypted to `configs/<hostname>_<ip>_<timestamp>.enc`)
-- [x] Baseline scan: finds links with CDP and compares both ends (MTU, speed/duplex, trunk/access,
+- [x] Baseline scan: finds links with CDP and compares both ends (MTU, speed/duplex, media type,
+      ARP type on routed ports, trunk/access,
       native + allowed VLANs, OSPF area/timers/passive/version, EtherChannel group/mode), and
       compares config with live state (OSPF neighbors, port-channel bundling, trunking)
       plus DTP (negotiated links, edge ports) and unhardened unused ports (parking VLAN)
+      and double-tagging VLAN hopping (untagged native VLAN that access ports also use)
       and management settings: hostname, same domain name everywhere, logging synchronous,
       NTP configured + synchronized + same time source, syslog server
       and edge-port security: port security, PortFast, BPDU Guard, DHCP snooping and DAI

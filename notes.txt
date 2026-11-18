@@ -1,0 +1,107 @@
+netaudit - working notes
+========================
+
+CURRENT GOAL
+  Read through all the code, make sure it's good, and make changes along the way.
+  (Feature work - traffic analysis, Catalyst Center, nornir, keyring - waits until this is done.)
+
+WHERE I LEFT OFF  (last updated 2026-11-18)
+  NEXT: main.py handle_findings() - read it through (the fix flow: choosing fixes,
+  ask_fix_value, the apply plan, apply_fixes, the post-fix re-scan, write memory).
+
+  Still open from earlier (parsers/ios.py): config_interface_sections() (used by
+  parse_interface_config), then the remaining parsers that build_snapshot() calls:
+  parse_cdp_neighbors, parse_ospf_interfaces, parse_ospf_neighbors, parse_vlans,
+  parse_management_config, parse_l2security_config, parse_dhcp_bindings,
+  parse_ntp_status, parse_rsa_key_name, interface_ips.
+
+READING PROGRESS
+  [x] inventory.py           Host, parse_hosts / format_hosts
+  [x] project.py             host management, create/load (rest of the file not yet)
+  [~] vault.py               skimmed (scrypt + Fernet) - not read line by line
+  [~] main.py                project_menu, fetch_configs, make_collector, choose_hosts,
+                             list_hosts, configs_menu, remove_old_configs, view_config,
+                             baseline_scan, view_scan (next: handle_findings)
+  [~] collectors/ssh.py      _session, fetch_running_config, fetch_snapshot
+                             (not yet: apply_config, write_memory)
+  [ ] collectors/hostkeys.py
+  [~] parsers/ios.py         normalize_interface, _ntc, parse_show_interfaces,
+                             _parse_key_value_blocks, parse_interfaces, parse_switchport,
+                             parse_etherchannel, parse_interface_config, build_snapshot
+  [~] models.py              InterfaceState, DeviceSnapshot (others only glanced at)
+  [~] scans/runner.py        collect_snapshots
+  [ ] scans/baseline.py
+  [ ] scans/l2security.py
+  [ ] scans/management.py
+  [ ] scans/fix_inputs.py
+  [ ] scans/remediation.py
+  [~] scans/report.py        ScanReport / BaselineReport (restructured)
+  [ ] recent.py
+  [ ] tests/
+
+CHANGES MADE DURING THE REVIEW
+  2026-11-18  ios.py: comments in build_snapshot explaining that "interfaces" is the core
+              dict, and docstrings listing which InterfaceState fields each apply_*() fills.
+  2026-11-18  ios.py: apply_config / apply_switchport / apply_etherchannel are now
+              table-driven (_CONFIG_FIELDS, _SWITCHPORT_FIELDS, _ETHERCHANNEL_FIELDS)
+              instead of long if/elif chains. New helper _leading_int(). Tests pass.
+  2026-11-18  Parse "Administrative Native VLAN tagging" -> InterfaceState.native_vlan_tagged
+              (True/False, None = line not shown).
+  2026-11-18  New check baseline.check_native_vlan_hopping ("native-vlan-hopping", medium):
+              an untagged native VLAN (not 1) that is also an access VLAN on the same switch.
+              Tagged = the switchport line says enabled OR global "vlan dot1q tag native".
+              No automatic fix (text only). Tests added. Fires on the lab's SW1 (VLAN 99:
+              native on trunks + Et0/0 access) - consider moving the trunks' native VLAN.
+  2026-11-18  ios.py: new parse_interfaces(outputs) creates the interfaces dict, passes it to
+              parse_show_interfaces / parse_switchport / parse_etherchannel /
+              parse_interface_config (renamed from apply_*), which fill it in place, and
+              returns it. build_snapshot just does interfaces=parse_interfaces(outputs).
+              All field writes go through _set_fields(), which raises on a misspelled field
+              name (plain setattr would silently create a new attribute). Test added.
+  2026-11-18  New InterfaceState fields media_type + arp_type (from "show interfaces"; ARP
+              type read by hand in _arp_types - the ntc-template skips that line). New link
+              checks: media-type-mismatch (low, no fix, "unknown" skipped) and
+              arp-type-mismatch (medium, routed ports only, fix = "arp arpa" on the non-ARPA
+              end). Sample faults on Et2/0 (ARP) and Et2/2 (media), tests added.
+  2026-11-18  Host lists (List hosts, Fetch running-configs) show the hostname. It comes from
+              the newest saved config file name (Project.last_known_hostnames), "?" if never
+              fetched/scanned - hosts.enc has no hostnames. main.host_line formats one host.
+  2026-11-18  project.py: renamed config_versions -> get_configs_sorted_by_time and
+              old_configs -> get_configs_old. Then get_configs_old was removed:
+              main.remove_old_configs reads the configs once and builds the "old" list itself.
+  2026-11-18  Renamed Project.list_configs -> list_configs_by_hostname and
+              main.choose_file -> choose_file_from_list.
+  2026-11-18  scans/report.py: ScanReport is now a base class; BaselineReport(ScanReport) adds
+              "links". JSON stores "kind"; ScanReport.from_dict picks the class via REPORT_KINDS
+              (no "kind" = old file = baseline). New report type = subclass + kind +
+              _fields_from_dict/_summary overrides + an entry in REPORT_KINDS. Tests added.
+  2026-11-18  main.handle_findings creates its own collector (after "Apply now?") instead of
+              getting one passed in; view_scan no longer creates one at all.
+
+ISSUES FOUND - NOT FIXED YET
+  1. Parser crash takes down the whole scan.
+     ntc-templates can raise TextFSMError on output lines they don't recognize (e.g. the
+     etherchannel template ends with "^. -> Error"). build_snapshot() runs outside
+     _session(), so this is NOT turned into a CollectorError, and scans/runner.py only
+     catches CollectorError -> the whole scan stops instead of skipping one device.
+     Idea: catch parser errors in fetch_snapshot() and raise CollectorError instead.
+
+  2. IPv6 addresses are never read.
+     The "show interfaces" ntc-template only captures IPv4 (IP_ADDRESS regex). On IPv6
+     interfaces ip_address is always "". Affects the management-SVI lockout guard in
+     l2security and NTP chain following (interface_ips). Fine for the IPv4 lab, but must
+     be fixed before managing devices over IPv6 (inventory already allows IPv6).
+
+  3. (minor) err-disabled detail is thrown away.
+     parse_show_interfaces keeps only "down" from "down (err-disabled)". Could be useful
+     for a future check (port shut by port security / BPDU guard).
+
+PYTHON THINGS LEARNED (quick reference)
+  - with + @contextmanager + yield  = RAII: setup before yield, cleanup after
+  - no block scope: variables set inside with/if/for live for the whole function
+  - objects are passed by reference: functions can modify a dict/object in place
+  - dict.get(key, default), dict.setdefault(key, default), dict/list comprehensions
+  - A if cond else B  = cond ? A : B
+  - zip(a, b) walks two lists side by side
+  - lambda, passing functions as values (str.lower), setattr(obj, "field", value)
+  - walrus  if m := re.fullmatch(...):   = assign and test in one go

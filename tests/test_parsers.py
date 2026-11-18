@@ -1,6 +1,9 @@
 """Tests for netaudit/parsers/ios.py. Run all tests with:  python -m pytest"""
 
+import pytest
+
 from netaudit.parsers.ios import (
+    _set_fields,
     build_snapshot,
     format_vlan_list,
     normalize_interface,
@@ -43,11 +46,30 @@ Trunking VLANs Enabled: 1-9,11,13,49,51,53,55,
     assert parse_vlan_list(snapshot.interfaces["Port-channel1"].allowed_vlans) >= {51, 53, 55, 57, 61}
 
 
+def test_misspelled_interface_field_is_an_error():
+    # setattr alone would silently create a new attribute and leave the real field empty
+    with pytest.raises(AttributeError):
+        _set_fields({}, "Ethernet0/1", {"nativ_vlan": 99})
+
+
+def test_native_vlan_tagging():
+    def tagged(line: str):
+        output = f"Name: Et0/1\nSwitchport: Enabled\nAdministrative Mode: trunk\n{line}\n"
+        return build_snapshot("1.1.1.1", "X", {"show interfaces switchport": output}).interfaces["Ethernet0/1"].native_vlan_tagged
+
+    assert tagged("Administrative Native VLAN tagging: enabled") is True
+    assert tagged("Administrative Native VLAN tagging: disabled") is False
+    assert tagged("Voice VLAN: none") is None  # line missing on this IOS -> unknown, not "disabled"
+
+
 def test_sw1_snapshot():
     snap = build_snapshot(SW1_IP, "SW1", SW1)
     et01 = snap.interfaces["Ethernet0/1"]
     assert (et01.is_trunk, et01.native_vlan, et01.allowed_vlans) == (True, 99, "10,20,99")
+    assert et01.native_vlan_tagged is False
     assert (et01.mtu, et01.duplex, et01.speed) == (1500, "full", "100mb/s")
+    assert (et01.media_type, et01.arp_type) == ("unknown", "arpa")
+    assert snap.interfaces["Ethernet2/2"].media_type == "10/100/1000basetx"
 
     et02 = snap.interfaces["Ethernet0/2"]
     assert (et02.channel_group, et02.channel_mode, et02.channel_member_flags) == (1, "passive", "I")

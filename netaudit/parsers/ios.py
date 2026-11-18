@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from collections.abc import Callable
 
 from ntc_templates.parse import parse_output
 
@@ -127,20 +128,75 @@ def _ospf_area(text: str) -> int:
 # ---------------------------------------------------------------- show commands
 
 
-def parse_show_interfaces(output: str) -> dict[str, InterfaceState]:
+# ---------------------------------------------------------------- interfaces
+#
+# One InterfaceState per port is built from FOUR sources. parse_interfaces() creates the
+# interfaces dict and passes it to the four parsers below; each one fills in its own fields on
+# the SAME InterfaceState objects (they modify the dict in place and return nothing - Python
+# passes references, like a std::map& in C++):
+#
+#     parse_show_interfaces   "show interfaces"             status, MTU, duplex, speed, media, ARP, IP
+#     parse_switchport        "show interfaces switchport"  mode, VLANs, native tagging, DTP
+#     parse_etherchannel      "show etherchannel summary"   channel group, protocol, member flags
+#     parse_interface_config  the running-config            portfast, port-security, snooping...
+#
+# All of them normalize interface names to the full form, so "Et0/1" in one output and
+# "Ethernet0/1" in another end up on the same InterfaceState.
+
+
+def parse_interfaces(outputs: dict[str, str]) -> dict[str, InterfaceState]:
+    """The core of the snapshot: {full interface name: InterfaceState}, one per port.
+
+    If two parsers set the same field, the later one wins - so the running-config comes last.
+    """
     interfaces: dict[str, InterfaceState] = {}
+    parse_show_interfaces(interfaces, outputs.get("show interfaces", ""))
+    parse_switchport(interfaces, outputs.get("show interfaces switchport", ""))
+    parse_etherchannel(interfaces, outputs.get("show etherchannel summary", ""))
+    parse_interface_config(interfaces, outputs.get("show running-config", ""))
+    return interfaces
+
+
+def _set_fields(interfaces: dict[str, InterfaceState], name: str, fields: dict[str, object]) -> None:
+    """Set fields on one interface's InterfaceState, creating it the first time it is seen."""
+    intf = interfaces.setdefault(name, InterfaceState(name=name))  # get, or insert new
+    for field_name, value in fields.items():
+        # setattr would silently ADD a new attribute for a misspelled name, and the real field
+        # would stay empty - so check that the field exists first.
+        if not hasattr(intf, field_name):
+            raise AttributeError(f"InterfaceState has no field {field_name!r}")
+        setattr(intf, field_name, value)  # same as intf.<field_name> = value
+
+
+def _arp_types(output: str) -> dict[str, str]:
+    """{interface: ARP type} from "show interfaces" - the ntc-template doesn't capture the
+    "  ARP type: ARPA, ARP Timeout 04:00:00" line, so it's read by hand."""
+    result: dict[str, str] = {}
+    current = None  # the interface whose block we're in
+    for line in output.splitlines():
+        if header := re.match(r"(\S+) is .*line protocol is", line):  # "Ethernet0/1 is up, line protocol is up"
+            current = normalize_interface(header.group(1))
+        elif current and (arp := re.match(r"\s+ARP type: (\w+)", line)):
+            result[current] = arp.group(1).lower()
+    return result
+
+
+def parse_show_interfaces(interfaces: dict[str, InterfaceState], output: str) -> None:
+    """"show interfaces": status, protocol, MTU, duplex, speed, media type, ARP type and IP
+    address of every interface."""
+    arp_types = _arp_types(output)
     for row in _ntc("show interfaces", output):
         name = normalize_interface(row["interface"])
-        interfaces[name] = InterfaceState(
-            name=name,
-            status=row["link_status"].strip().lower(),
-            protocol=row["protocol_status"].strip().lower().split()[0] if row["protocol_status"] else "",
-            mtu=int(row["mtu"]) if row["mtu"] else None,
-            duplex=_normalize_duplex(row["duplex"]),
-            speed=_normalize_speed(row["speed"]),
-            ip_address=row["ip_address"],
-        )
-    return interfaces
+        _set_fields(interfaces, name, {
+            "status": row["link_status"].strip().lower(),
+            "protocol": row["protocol_status"].strip().lower().split()[0] if row["protocol_status"] else "",
+            "mtu": int(row["mtu"]) if row["mtu"] else None,
+            "duplex": _normalize_duplex(row["duplex"]),
+            "speed": _normalize_speed(row["speed"]),
+            "media_type": row["media_type"].strip().lower(),
+            "arp_type": arp_types.get(name, ""),
+            "ip_address": row["ip_address"],
+        })
 
 
 def _parse_key_value_blocks(output: str, first_key: str) -> list[dict[str, str]]:
@@ -165,8 +221,32 @@ def _parse_key_value_blocks(output: str, first_key: str) -> list[dict[str, str]]
     return blocks
 
 
-def apply_switchport(interfaces: dict[str, InterfaceState], output: str) -> None:
-    """Add "show interfaces switchport" data to the interfaces (modifies them in place).
+def _leading_int(text: str) -> int | None:
+    """"99 (VLAN0099)" -> 99, "1 (default)" -> 1, "" -> None."""
+    match = re.match(r"\d+", text)  # re.match only matches at the START of the string
+    return int(match.group()) if match else None
+
+
+# What parse_switchport() reads from each port's block of "show interfaces switchport":
+# (key as IOS prints it, InterfaceState field to set, function turning the raw text into the value).
+# A missing key reads as "" - routed ports only print "Name" and "Switchport: Disabled".
+# str.lower is passed as a function without calling it (no "()"): str.lower("ON") == "on".
+_SWITCHPORT_FIELDS: list[tuple[str, str, Callable[[str], object]]] = [
+    ("Switchport", "switchport", lambda v: v.lower() == "enabled"),
+    ("Administrative Mode", "admin_mode", str.lower),  # what's configured: "dynamic auto"...
+    ("Operational Mode", "oper_mode", str.lower),  # what the port does now: "trunk", "down"...
+    ("Trunking Native Mode VLAN", "native_vlan", _leading_int),
+    # "enabled"/"disabled"; None if this IOS doesn't print the line - unknown is not "disabled"
+    ("Administrative Native VLAN tagging", "native_vlan_tagged", lambda v: v.lower() == "enabled" if v else None),
+    ("Access Mode VLAN", "access_vlan", _leading_int),
+    ("Trunking VLANs Enabled", "allowed_vlans", lambda v: v),  # kept as text: "ALL", "10,20,99"
+    ("Negotiation of Trunking", "dtp", lambda v: v.lower() == "on"),
+    ("Administrative Trunking Encapsulation", "trunk_encapsulation", str.lower),
+]
+
+
+def parse_switchport(interfaces: dict[str, InterfaceState], output: str) -> None:
+    """"show interfaces switchport": the fields in _SWITCHPORT_FIELDS for every port.
 
     Parsed by hand instead of with ntc-templates: its template drops VLANs when a long
     "Trunking VLANs Enabled" list wraps onto the next line.
@@ -174,18 +254,9 @@ def apply_switchport(interfaces: dict[str, InterfaceState], output: str) -> None
     if _is_error(output):
         return
     for block in _parse_key_value_blocks(output, first_key="Name"):
-        name = normalize_interface(block["Name"])
-        intf = interfaces.setdefault(name, InterfaceState(name=name))  # get, or insert new
-        intf.switchport = block.get("Switchport", "").lower() == "enabled"
-        intf.admin_mode = block.get("Administrative Mode", "").lower()
-        intf.oper_mode = block.get("Operational Mode", "").lower()
-        native = re.match(r"\d+", block.get("Trunking Native Mode VLAN", ""))
-        intf.native_vlan = int(native.group()) if native else None
-        access = re.match(r"\d+", block.get("Access Mode VLAN", ""))
-        intf.access_vlan = int(access.group()) if access else None
-        intf.allowed_vlans = block.get("Trunking VLANs Enabled", "")
-        intf.dtp = block.get("Negotiation of Trunking", "").lower() == "on"
-        intf.trunk_encapsulation = block.get("Administrative Trunking Encapsulation", "").lower()
+        _set_fields(interfaces, normalize_interface(block["Name"]), {
+            field_name: convert(block.get(key, "")) for key, field_name, convert in _SWITCHPORT_FIELDS
+        })
 
 
 _VLAN_LINE = re.compile(r"^(?P<id>\d+)\s+(?P<name>\S+)\s+(?:active|suspended|act/\S+)", re.M)
@@ -198,18 +269,27 @@ def parse_vlans(output: str) -> dict[int, str]:
     return {int(m["id"]): m["name"] for m in _VLAN_LINE.finditer(output)}
 
 
-def apply_etherchannel(interfaces: dict[str, InterfaceState], output: str) -> None:
-    """Add "show etherchannel summary" data: which port-channel each member belongs to."""
+# What parse_etherchannel() reads from each channel-group row (ntc-template keys). These are the
+# same for every member port; the per-port status flags are added separately in the member loop.
+_ETHERCHANNEL_FIELDS: list[tuple[str, str, Callable[[str], object]]] = [
+    ("group", "channel_group", int),  # "1" -> 1
+    ("bundle_protocol", "channel_protocol", str.strip),  # "LACP", "PAgP", "-" (= mode on)
+]
+
+
+def parse_etherchannel(interfaces: dict[str, InterfaceState], output: str) -> None:
+    """"show etherchannel summary": which port-channel each member port belongs to
+    (channel_group, channel_protocol, channel_member_flags). channel_mode comes from the config."""
     for row in _ntc("show etherchannel summary", output):
-        group = int(row["group"])
-        protocol = row["bundle_protocol"].strip()
+        # dict comprehension: {field name: converted value} for the whole channel group
+        channel_values = {field_name: convert(row[key]) for key, field_name, convert in _ETHERCHANNEL_FIELDS}
         for member, flags in zip(row["member_interface"], row["member_interface_status"]):
             # zip() walks two lists side by side: (member1, flags1), (member2, flags2)...
-            name = normalize_interface(member)
-            intf = interfaces.setdefault(name, InterfaceState(name=name))
-            intf.channel_group = group
-            intf.channel_protocol = protocol
-            intf.channel_member_flags = flags.strip()
+            # {**a, "x": 1} = a copy of dict a plus one more key
+            _set_fields(interfaces, normalize_interface(member), {
+                **channel_values,
+                "channel_member_flags": flags.strip(),  # per port: "P" bundled, "I" stand-alone...
+            })
 
 
 def parse_cdp_neighbors(output: str) -> list[CdpNeighbor]:
@@ -394,53 +474,53 @@ def interface_ips(output: str) -> set[str]:
     return {row["ip_address"] for row in _ntc("show interfaces", output) if row["ip_address"]}
 
 
-def apply_config(interfaces: dict[str, InterfaceState], config: str) -> None:
-    """Add settings that only the running-config shows (modifies interfaces in place)."""
+# What parse_interface_config() looks for inside each "interface ..." section of the running-config.
+# One entry per setting: (regex the WHOLE line must match, InterfaceState field to set, value).
+# The value is a function of the regex match - "lambda m: m.group(1)" is a tiny unnamed
+# function (like a C++ lambda) returning the first (...) group; "lambda m: True" ignores it.
+# Every entry is checked against every line, so one line can set several fields
+# (channel-group). To support a new setting: add a field to InterfaceState and an entry here.
+_CONFIG_FIELDS: list[tuple[re.Pattern[str], str, Callable[[re.Match[str]], object]]] = [
+    (re.compile(r"channel-group (\d+) mode \S+"), "channel_group", lambda m: int(m.group(1))),
+    (re.compile(r"channel-group \d+ mode (\S+)"), "channel_mode", lambda m: m.group(1)),
+    (re.compile(r"speed (\S+)"), "configured_speed", lambda m: m.group(1)),
+    (re.compile(r"duplex (\S+)"), "configured_duplex", lambda m: m.group(1)),
+    (re.compile(r"(?:ipv6 ospf \d+ area|ospfv3 \d+ (?:ipv4|ipv6) area).*"), "ospfv3", lambda m: True),
+    (re.compile(r"spanning-tree portfast(?: edge)?"), "portfast", lambda m: "enable"),
+    (re.compile(r"spanning-tree portfast disable"), "portfast", lambda m: "disable"),
+    (re.compile(r"spanning-tree bpduguard (enable|disable)"), "bpduguard", lambda m: m.group(1)),
+    # Only the bare line turns it ON - "switchport port-security maximum 2" etc. don't match
+    (re.compile(r"switchport port-security"), "port_security", lambda m: True),
+    (re.compile(r"ip dhcp snooping trust"), "dhcp_trust", lambda m: True),
+    (re.compile(r"ip dhcp snooping limit rate (\d+)"), "dhcp_rate", lambda m: int(m.group(1))),
+    (re.compile(r"ip arp inspection trust"), "dai_trust", lambda m: True),
+    (re.compile(r"ip arp inspection limit rate (\d+).*"), "dai_rate", lambda m: int(m.group(1))),
+]
+
+
+def parse_interface_config(interfaces: dict[str, InterfaceState], config: str) -> None:
+    """Settings that only the running-config shows, per interface section: the fields in
+    _CONFIG_FIELDS (channel_mode, configured speed/duplex, ospfv3, portfast, bpduguard,
+    port_security, DHCP snooping and DAI trust/rate)."""
     for name, lines in config_interface_sections(config).items():
-        intf = interfaces.setdefault(name, InterfaceState(name=name))
+        fields: dict[str, object] = {}
         for line in lines:
-            if match := re.fullmatch(r"channel-group (\d+) mode (\S+)", line):
+            for pattern, field_name, value in _CONFIG_FIELDS:
                 # ":=" is the "walrus" operator: assign AND test in one go, like
                 # "if (auto m = ...; m)" in C++17
-                intf.channel_group = intf.channel_group or int(match.group(1))
-                intf.channel_mode = match.group(2)
-            elif match := re.fullmatch(r"speed (\S+)", line):
-                intf.configured_speed = match.group(1)
-            elif match := re.fullmatch(r"duplex (\S+)", line):
-                intf.configured_duplex = match.group(1)
-            elif re.match(r"(ipv6 ospf \d+ area|ospfv3 \d+ (ipv4|ipv6) area)", line):
-                intf.ospfv3 = True
-            elif re.fullmatch(r"spanning-tree portfast( edge)?", line):
-                intf.portfast = "enable"
-            elif line == "spanning-tree portfast disable":
-                intf.portfast = "disable"
-            elif match := re.fullmatch(r"spanning-tree bpduguard (enable|disable)", line):
-                intf.bpduguard = match.group(1)
-            elif line == "switchport port-security":  # the line that turns it ON
-                intf.port_security = True
-            elif line == "ip dhcp snooping trust":
-                intf.dhcp_trust = True
-            elif match := re.fullmatch(r"ip dhcp snooping limit rate (\d+)", line):
-                intf.dhcp_rate = int(match.group(1))
-            elif line == "ip arp inspection trust":
-                intf.dai_trust = True
-            elif match := re.fullmatch(r"ip arp inspection limit rate (\d+).*", line):
-                intf.dai_rate = int(match.group(1))
+                if match := pattern.fullmatch(line):
+                    fields[field_name] = value(match)
+        _set_fields(interfaces, name, fields)  # also with no matches: every section gets an InterfaceState
 
 
 def build_snapshot(host_ip: str, hostname: str, outputs: dict[str, str]) -> DeviceSnapshot:
     """Combine the output of all show commands (keyed by command) into one DeviceSnapshot."""
-    interfaces = parse_show_interfaces(outputs.get("show interfaces", ""))
-    apply_switchport(interfaces, outputs.get("show interfaces switchport", ""))
-    apply_etherchannel(interfaces, outputs.get("show etherchannel summary", ""))
-    config = outputs.get("show running-config", "")
-    apply_config(interfaces, config)
-
+    config = outputs.get("show running-config", "")  # used by several parsers below
     snapshot = DeviceSnapshot(
         host_ip=host_ip,
         hostname=hostname,
         running_config=config,
-        interfaces=interfaces,
+        interfaces=parse_interfaces(outputs),  # the core: one InterfaceState per port. Fill out the InterfaceState structure.
         cdp_neighbors=parse_cdp_neighbors(outputs.get("show cdp neighbors detail", "")),
         ospf_interfaces=parse_ospf_interfaces(outputs.get("show ip ospf interface", "")),
         ospf_neighbors=parse_ospf_neighbors(outputs.get("show ip ospf neighbor", "")),

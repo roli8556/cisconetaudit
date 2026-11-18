@@ -8,7 +8,7 @@ from netaudit.parsers.ios import build_snapshot
 from netaudit.scans import fix_inputs
 from netaudit.scans.baseline import BaselineScan
 from netaudit.scans.remediation import commands_per_device
-from netaudit.scans.report import ScanReport
+from netaudit.scans.report import BaselineReport, ScanReport
 from tests.sample_outputs import SW1, SW1_IP, SW2, SW2_IP
 
 
@@ -50,6 +50,23 @@ def test_trunk_findings(scan):
     assert not find(scan, "native-vlan-1", "SW2 Et0/1")  # covered by the mismatch finding
 
 
+def test_native_vlan_hopping(scan):
+    # SW1: VLAN 99 is native on Et0/1 and Po1 (members Et0/2-0/3) and the access VLAN of Et0/0
+    hopping = find(scan, "native-vlan-hopping")
+    assert [f.location for f in hopping] == ["SW1 VLAN 99"]
+    assert "Et0/1, Po1" in hopping[0].message and "of Et0/0." in hopping[0].message
+    # SW2 uses native 99 too, but has no access port in VLAN 99; VLAN 1 is left to native-vlan-1
+
+
+def test_native_vlan_tagging_prevents_hopping():
+    tagged_ports = dict(SW1, **{"show interfaces switchport": SW1["show interfaces switchport"].replace(
+        "Administrative Native VLAN tagging: disabled", "Administrative Native VLAN tagging: enabled")})
+    assert not find(run_scan(tagged_ports, SW2), "native-vlan-hopping")
+    # Same result from the global command alone (some IOS versions don't print the switchport line)
+    tagged_config = dict(SW1, **{"show running-config": "vlan dot1q tag native\n" + SW1["show running-config"]})
+    assert not find(run_scan(tagged_config, SW2), "native-vlan-hopping")
+
+
 def test_etherchannel_findings(scan):
     modes = find(scan, "etherchannel-mode-mismatch")
     assert {f.location for f in modes} == {"SW1 Et0/2 <-> SW2 Et0/2", "SW1 Et0/3 <-> SW2 Et0/3"}
@@ -67,6 +84,14 @@ def test_physical_findings(scan):
     duplex = find(scan, "duplex-mismatch", "Et1/1")[0]
     assert duplex.fixes[0].hostname == "SW1"  # only SW1 is hardcoded
     assert find(scan, "speed-mismatch", "Et1/1")[0].severity == "low"
+
+    media = find(scan, "media-type-mismatch")
+    assert [f.location for f in media] == ["SW1 Et2/2 <-> SW2 Et2/2"]  # "unknown" ends are skipped
+    assert "10/100/1000basetx vs 1000baselx sfp" in media[0].message
+
+    arp = find(scan, "arp-type-mismatch")
+    assert [f.location for f in arp] == ["SW1 Et2/0 <-> SW2 Et2/0"]  # routed ports only
+    assert [(fix.hostname, fix.commands) for fix in arp[0].fixes] == [("SW2", ["interface Ethernet2/0", "arp arpa"])]
 
 
 def test_ospf_findings(scan):
@@ -281,6 +306,13 @@ def test_renumber_keeps_mode_fix(scan):
 
 
 def test_report_roundtrip(scan):
-    report = ScanReport("baseline", datetime(2026, 11, 17, 12, 0), findings=scan["findings"])
+    report = BaselineReport("baseline", datetime(2026, 11, 17, 12, 0), findings=scan["findings"], links=["SW1 Et0/1 <-> SW2 Et0/1"])
     again = ScanReport.from_dict(report.to_dict())
     assert again.findings == report.findings  # FixInputs and FixTargets survive the JSON trip
+    assert type(again) is BaselineReport and again == report  # same subclass back, links included
+
+
+def test_report_saved_before_subclasses_loads_as_baseline():
+    old = BaselineReport("baseline", datetime(2026, 11, 17, 12, 0)).to_dict()
+    del old["kind"]  # files written before report subclasses existed have no "kind"
+    assert type(ScanReport.from_dict(old)) is BaselineReport

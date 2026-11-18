@@ -136,11 +136,21 @@ def prompt_load_project(path: Path | None = None) -> Project | None:
 
 # ---------- host actions (need a loaded project) ----------
 
+def host_line(host: Host, hostnames: dict[str, str]) -> str:
+    """One host for the host lists: hostname (from the newest saved config, "?" if the device
+    was never fetched or scanned), IP and username. The password is never shown."""
+    return f"{hostnames.get(host.ip, '?'):<20} {host.ip:<16} user: {host.username}"
+
+
 def list_hosts(project: Project) -> None:
     if not project.hosts:
         print("  No hosts yet.")
+        return
+    hostnames = project.last_known_hostnames()
     for host in project.hosts:
-        print(f"    - {host.ip:<16} user: {host.username}")  # password is never shown
+        print(f"    - {host_line(host, hostnames)}")
+    if len(hostnames) < len(project.hosts):
+        print("  (? = hostname not known yet: fetch its running-config or run a scan)")
 
 
 def add_host(project: Project) -> None:
@@ -192,7 +202,7 @@ def ask_yes_no(question: str) -> bool:
     return input(f"{question} [y/N]: ").strip().lower() in ("y", "yes")
 
 
-def choose_file(files: list[Path], what: str) -> Path | None:
+def choose_file_from_list(files: list[Path], what: str) -> Path | None:
     """Show a numbered list of files and let the user pick one."""
     if not files:
         print(f"  No saved {what} yet.")
@@ -209,8 +219,9 @@ def choose_file(files: list[Path], what: str) -> Path | None:
 
 def choose_hosts(project: Project) -> list[Host]:
     """Let the user pick hosts: Enter = all, or numbers like "2" or "1,3"."""
+    hostnames = project.last_known_hostnames()
     for number, host in enumerate(project.hosts, start=1):
-        print(f"    {number:>3}) {host.ip:<16} user: {host.username}")
+        print(f"    {number:>3}) {host_line(host, hostnames)}")
     while True:
         answer = input("  Hosts to fetch (e.g. 2 or 1,3 - Enter = all): ").strip()
         if not answer:
@@ -246,7 +257,7 @@ def fetch_configs(project: Project) -> None:
 def configs_menu(project: Project) -> None:
     actions = {"1": view_config, "2": remove_old_configs}
     while True:
-        versions = project.config_versions()
+        versions = project.get_configs_sorted_by_time()
         total = sum(len(paths) for paths in versions.values())
         print(f"\n=== netaudit | project: {project.config.name} | saved configs ===")
         print(f"  {total} config(s) from {len(versions)} device(s)")
@@ -261,12 +272,15 @@ def configs_menu(project: Project) -> None:
 
 
 def remove_old_configs(project: Project) -> None:
-    old = project.old_configs()
+    """Delete every saved config except the newest one of each device (after asking)."""
+    configs = project.get_configs_sorted_by_time()  # {ip: [oldest ... newest]} - read once
+    # paths[:-1] = all but the last (newest) element - a slice, like a sub-range in C++
+    old = [path for paths in configs.values() for path in paths[:-1]]
     if not old:
         print("  Nothing to remove - every device has only one saved config.")
         return
     print(f"  {len(old)} older config(s) will be deleted; the newest per device is kept:")
-    for ip, paths in project.config_versions().items():
+    for ip, paths in configs.items():
         if len(paths) > 1:
             print(f"    {ip:<16} keep {paths[-1].stem}, delete {len(paths) - 1} older")
     if not ask_yes_no("  Delete them? This can't be undone"):
@@ -278,7 +292,7 @@ def remove_old_configs(project: Project) -> None:
 
 def view_config(project: Project) -> None:
     """Saved configs are encrypted, so this is the way to read them."""
-    path = choose_file(project.list_configs(), "configs")
+    path = choose_file_from_list(project.list_configs_by_hostname(), "configs")
     if path is None:
         return
     try:
@@ -429,7 +443,7 @@ def baseline_scan(project: Project) -> None:
     print()
     print(report.format())
     if report.findings:
-        handle_findings(project, collector, report)
+        handle_findings(project, report)
 
 
 RECENT = RecentProjects(default_file())  # module-level: one shared list for the whole program
@@ -447,7 +461,7 @@ def format_age(age: timedelta) -> str:
 
 def view_scan(project: Project) -> None:
     """Show a saved report - and, like right after a scan, offer to handle its findings."""
-    path = choose_file(project.list_scans(), "scan reports")
+    path = choose_file_from_list(project.list_scans(), "scan reports")
     if path is None:
         return
     try:
@@ -469,11 +483,8 @@ def view_scan(project: Project) -> None:
         print("  Running a new scan (Scan menu -> 1) is safer.")
         if not ask_yes_no("  Use this old scan anyway?"):
             return
-    collector = make_collector(project)
-    if collector is None:
-        return
     project.log.info("Handling findings from saved scan %s (%s old)", path.name, format_age(age))
-    handle_findings(project, collector, report)
+    handle_findings(project, report)
 
 
 def ask_fix_value(finding: Finding) -> Finding | None:
@@ -519,8 +530,9 @@ def ask_followup(question: FixQuestion) -> str:
         print(f"     {error}")
 
 
-def handle_findings(project: Project, collector: SshCollector, report: ScanReport) -> None:
-    """After a scan: let the user pick how to deal with the findings."""
+def handle_findings(project: Project, report: ScanReport) -> None:
+    """After a scan (or for a saved report): let the user pick how to deal with the findings.
+    The SSH collector is only created once the user confirms that changes will be applied."""
     fixable = [f for f in report.findings if f.fixable]
     print(f"\n{len(fixable)} of {len(report.findings)} findings have an automatic fix; the rest must be fixed by hand.")
     if not fixable:
@@ -575,6 +587,9 @@ def handle_findings(project: Project, collector: SshCollector, report: ScanRepor
         print("  Cancelled - no changes made.")
         return
 
+    collector = make_collector(project)  # from here on we talk to the devices
+    if collector is None:
+        return
     progress = lambda line: print(f"    {line}")
     results = apply_fixes(project, collector, selected, progress)
     if not any(r.ok for r in results):

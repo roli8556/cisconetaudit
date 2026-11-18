@@ -41,6 +41,11 @@ _CONFIG_NAME = re.compile(
 )
 
 
+def _safe_ip(ip: str) -> str:
+    """The IP as it appears in config file names: IPv6 ":" is invalid in Windows file names."""
+    return ip.replace(":", "-")
+
+
 _NEW, _OLD = ".pwchange-new", ".pwchange-old"  # temporary suffixes while the password changes
 
 
@@ -234,19 +239,18 @@ class Project:
         Every fetch gets a new file, so old configs are kept for comparison.
         """
         stamp = config.collected_at.strftime("%Y-%m-%dT%H-%M-%S")  # no ":" - invalid on Windows
-        # IPv6 has ":" too, and the hostname comes from the device - so whitelist the characters
-        safe_ip = config.host_ip.replace(":", "-")
+        # The hostname comes from the device - so whitelist the characters
         safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", config.hostname) or "unknown"
-        path = _unique_path(self.configs_dir / f"{safe_name}_{safe_ip}_{stamp}.enc")
+        path = _unique_path(self.configs_dir / f"{safe_name}_{_safe_ip(config.host_ip)}_{stamp}.enc")
         self._vault.write(path, config.text)
         self.log.info("Running-config saved: %s -> %s", config.host_ip, path.name)
         return path
 
-    def list_configs(self) -> list[Path]:
+    def list_configs_by_hostname(self) -> list[Path]:
         """All saved configs, sorted by name (= by hostname, then IP, then time)."""
         return sorted(self.configs_dir.glob("*.enc"))
 
-    def config_versions(self) -> dict[str, list[Path]]:
+    def get_configs_sorted_by_time(self) -> dict[str, list[Path]]:
         """Saved configs per device: {ip: [oldest ... newest]}.
 
         Grouped by IP, not hostname: a renamed switch keeps its history. Files whose name
@@ -261,10 +265,17 @@ class Project:
                 versions.setdefault(match["ip"], []).append((order, path))
         return {ip: [path for _, path in sorted(items)] for ip, items in sorted(versions.items())}
 
-    def old_configs(self) -> list[Path]:
-        """Every saved config except the newest one of each device."""
-        return [path for paths in self.config_versions().values() for path in paths[:-1]]
-        # paths[:-1] = all but the last element (a slice, like a sub-range in C++)
+    def last_known_hostnames(self) -> dict[str, str]:
+        """{host IP: hostname} for display, taken from each host's newest saved config file name
+        (configs are saved by "Fetch running-configs" and by every scan). The inventory itself
+        has no hostnames, so hosts that were never reached are missing from the dict."""
+        versions = self.get_configs_sorted_by_time()
+        names: dict[str, str] = {}
+        for host in self.hosts:
+            paths = versions.get(_safe_ip(host.ip))
+            if paths:  # paths[-1] = the newest file; its name starts with the hostname
+                names[host.ip] = _CONFIG_NAME.fullmatch(paths[-1].stem)["name"]
+        return names
 
     def delete_configs(self, paths: list[Path]) -> None:
         for path in paths:
@@ -348,7 +359,7 @@ class Project:
         old_vault, _ = Vault.unlock(self.path / HOSTS_FILE, current)  # proves the current password
         new_vault = Vault.new(new)  # new random salt too
         log_file = self.path / LOG_FILE
-        files = [self.path / HOSTS_FILE, *self.list_configs(), *self.list_scans()]
+        files = [self.path / HOSTS_FILE, *self.list_configs_by_hostname(), *self.list_scans()]
 
         # Phase 1: prepare. Any error -> remove what was prepared; nothing has changed.
         staged: list[Path] = []

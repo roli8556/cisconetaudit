@@ -14,7 +14,7 @@ from ..collectors.ssh import CollectorError, SshCollector
 from ..models import DeviceSnapshot, RunningConfig
 from ..project import Project
 from .baseline import BaselineScan
-from .report import ScanReport
+from .report import BaselineReport
 
 Progress = Callable[[str], None]  # receives one status line, e.g. "192.168.100.11 OK"
 
@@ -41,8 +41,8 @@ def collect_snapshots(
     return snapshots, failed
 
 
-def run_baseline(project: Project, collector: SshCollector, progress: Progress, scan_type: str = "baseline") -> ScanReport:
-    report = ScanReport(scan_type=scan_type, started=datetime.now())
+def run_baseline(project: Project, collector: SshCollector, progress: Progress, scan_type: str = "baseline") -> BaselineReport:
+    report = BaselineReport(scan_type=scan_type, started=datetime.now())
     project.log.info("Scan started: %s (%d hosts)", scan_type, len(project.hosts))
 
     snapshots, report.failed = collect_snapshots(project, collector, progress)
